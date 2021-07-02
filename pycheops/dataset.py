@@ -77,6 +77,7 @@ import cdspyreadme
 import os
 from textwrap import fill, indent
 from contextlib import redirect_stdout
+from pathos.multiprocessing import ProcessingPool as Pool
 
 try:
     from dace.cheops import Cheops
@@ -307,7 +308,9 @@ class Dataset(object):
 
     def __init__(self, file_key, force_download=False, download_all=True,
             configFile=None, target=None, verbose=True, metadata=True, 
-            view_report_on_download=True):
+            view_report_on_download=True, n_threads=1):
+
+        self.n_threads = n_threads
 
         m = _file_key_re.search(file_key)
         if m is None:
@@ -1870,19 +1873,21 @@ class Dataset(object):
                 lnpost_i, lnlike_i = log_posterior_func(pos_i, *args)
             pos.append(pos_i)
 
-        sampler = EnsembleSampler(nwalkers, n_varys, log_posterior_func,
-            args=args)
-        if progress:
-            print('Running burn-in ..')
-            stdout.flush()
-        pos,_,_,_ = sampler.run_mcmc(pos, burn, store=False, 
-            skip_initial_state_check=True, progress=progress)
-        sampler.reset()
-        if progress:
-            print('Running sampler ..')
-            stdout.flush()
-        state = sampler.run_mcmc(pos, steps, thin_by=thin,
-            skip_initial_state_check=True, progress=progress)
+        with Pool(self.n_threads) as pool:
+            print(f"Running MCMC with {self.n_threads} cores")
+            sampler = EnsembleSampler(nwalkers, n_varys, log_posterior_func,
+                args=args, pool=pool)
+            if progress:
+                print('Running burn-in ..')
+                stdout.flush()
+            pos,_,_,_ = sampler.run_mcmc(pos, burn, store=False, 
+                skip_initial_state_check=True, progress=progress)
+            sampler.reset()
+            if progress:
+                print('Running sampler ..')
+                stdout.flush()
+            state = sampler.run_mcmc(pos, steps, thin_by=thin,
+                skip_initial_state_check=True, progress=progress)
 
         flatchain = sampler.get_chain(flat=True).reshape((-1, len(vn)))
         pos_i = flatchain[np.argmax(sampler.get_log_prob()),:]
