@@ -55,7 +55,7 @@ from copy import copy, deepcopy
 from .utils import phaser, lcbin
 from scipy.stats import iqr
 
-from pathos.multiprocessing import ProcessingPool as Pool
+from pathos.pools import ThreadPool as Pool
 
 # Iteration limit for initialosation of walkers
 _ITMAX_ = 999

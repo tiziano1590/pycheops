@@ -76,7 +76,7 @@ import cdspyreadme
 import os
 from textwrap import fill, indent
 from contextlib import redirect_stdout
-from pathos.multiprocessing import ProcessingPool as Pool
+from pathos.pools import ThreadPool as Pool
 
 try:
     from dace.cheops import Cheops
