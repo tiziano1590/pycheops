@@ -77,6 +77,7 @@ import os
 from textwrap import fill, indent
 from contextlib import redirect_stdout
 from pathos.pools import ThreadPool as Pool
+import dynesty as dy
 
 try:
     from dace.cheops import Cheops
