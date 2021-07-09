@@ -146,6 +146,7 @@ def _make_trial_params(pos, params, vn):
     # If any of the parameters are out of range, returns None, -inf
     parcopy = params.copy()
     lnprior = 0
+    # TODO very ugly and probably wrong, rewrite and restore
     try:
         for i, p in enumerate(vn):
             v = pos[i]
@@ -2149,6 +2150,7 @@ class Dataset(object):
             },
             ptform_kwargs={"params": params, "vn": vn},
         )
+        # TODO add optimisation parameters
         sampler.run_nested()
         # sampler = EnsembleSampler(
         #     nwalkers, n_varys, log_posterior_func, args=args, pool=pool
@@ -2225,17 +2227,13 @@ class Dataset(object):
         return result
 
     def dynesty_priors(self, theta, **kwargs):
-        # _make_trial_params(pos, params, vn)
         _, lnpriors = _make_trial_params(theta, **kwargs)
         return lnpriors
 
     def dynesty_likelihoods(self, theta, **kwargs):
-
-        # chi_out = self(theta, self.include_priors)
+        # TODO generalise log_posterior function
         chi_out, _ = _log_posterior_jitter(theta, **kwargs)
 
-        # if chi_out < -0.5e10:
-        #     return -0.5e10
         return chi_out
 
     def nested_sampling_prior_compute(self, val, kind, coeff, space):
