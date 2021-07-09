@@ -146,11 +146,18 @@ def _make_trial_params(pos, params, vn):
     # If any of the parameters are out of range, returns None, -inf
     parcopy = params.copy()
     lnprior = 0
-    for i, p in enumerate(vn):
-        v = pos[i]
-        if (v < parcopy[p].min) or (v > parcopy[p].max):
-            return None, -np.inf
-        parcopy[p].value = v
+    try:
+        for i, p in enumerate(vn):
+            v = pos[i]
+            if (v < parcopy[p].min) or (v > parcopy[p].max):
+                return None, -np.inf
+            parcopy[p].value = v
+    except IndexError:
+        for i, p in enumerate(vn):
+            v = pos
+            if (v < parcopy[p].min) or (v > parcopy[p].max):
+                return None, -np.inf
+            parcopy[p].value = v
 
     lnprior = _log_prior(parcopy["D"], parcopy["W"], parcopy["b"])
     if not np.isfinite(lnprior):
@@ -2140,6 +2147,7 @@ class Dataset(object):
                 "vn": vn,
                 "return_fit": return_fit,
             },
+            ptform_kwargs={"params": params, "vn": vn},
         )
         sampler.run_nested()
         # sampler = EnsembleSampler(
@@ -2216,14 +2224,10 @@ class Dataset(object):
         self.__lastfit__ = "emcee"
         return result
 
-    def dynesty_priors(self, cube):
-        theta = np.zeros(len(cube), dtype=np.double)
-
-        # for i in range(0, len(cube)):
-        #     # theta[i] = self.nested_sampling_prior_compute(
-        #     #     cube[i], self.priors[i][0], self.priors[i][2], self.spaces[i])
-        #     theta[i] = 10.0 * (2.0 * cube[i] - 1.0)
-        return 10.0 * (2.0 * cube - 1.0)
+    def dynesty_priors(self, theta, **kwargs):
+        # _make_trial_params(pos, params, vn)
+        _, lnpriors = _make_trial_params(theta, **kwargs)
+        return lnpriors
 
     def dynesty_likelihoods(self, theta, **kwargs):
 
