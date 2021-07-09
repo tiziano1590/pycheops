@@ -2232,7 +2232,7 @@ class Dataset(object):
     def dynesty_likelihoods(self, theta, **kwargs):
 
         # chi_out = self(theta, self.include_priors)
-        chi_out = _log_posterior_jitter(theta, **kwargs)
+        chi_out, _ = _log_posterior_jitter(theta, **kwargs)
 
         # if chi_out < -0.5e10:
         #     return -0.5e10
