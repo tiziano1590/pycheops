@@ -52,6 +52,8 @@ from sys import stdout
 from astropy.coordinates import SkyCoord, get_body, Angle
 from lmfit.printfuncs import gformat
 from scipy.signal import medfilt
+from scipy.interpolate import splev
+from scipy import stats
 from .utils import lcbin, mode
 import astropy.units as u
 from uncertainties import ufloat, UFloat
@@ -77,7 +79,8 @@ import os
 from textwrap import fill, indent
 from contextlib import redirect_stdout
 from pathos.pools import ThreadPool as Pool
-import dynesty as dy
+import dynesty as dyn
+import multiprocessing
 
 try:
     from dace.cheops import Cheops
@@ -2122,28 +2125,44 @@ class Dataset(object):
                 lnpost_i, lnlike_i = log_posterior_func(pos_i, *args)
             pos.append(pos_i)
 
-        with Pool(self.n_threads) as pool:
-            print(f"Running MCMC with {self.n_threads} cores")
-            sampler = EnsembleSampler(
-                nwalkers, n_varys, log_posterior_func, args=args, pool=pool
-            )
-            if progress:
-                print("Running burn-in ..")
-                stdout.flush()
-            pos, _, _, _ = sampler.run_mcmc(
-                pos, burn, store=False, skip_initial_state_check=True, progress=progress
-            )
-            sampler.reset()
-            if progress:
-                print("Running sampler ..")
-                stdout.flush()
-            state = sampler.run_mcmc(
-                pos,
-                steps,
-                thin_by=thin,
-                skip_initial_state_check=True,
-                progress=progress,
-            )
+        # with Pool(self.n_threads) as pool:
+        print(f"Running Dynamic Nested sampling")
+        sampler = dyn.DynamicNestedSampler(
+            self.dynesty_likelihoods,
+            self.dynesty_priors,
+            n_varys,
+            logl_kwargs={
+                "model": model,
+                "time": time,
+                "flux": flux,
+                "flux_err": flux_err,
+                "params": params,
+                "vn": vn,
+                "return_fit": return_fit,
+            },
+        )
+        sampler.run_nested()
+        # sampler = EnsembleSampler(
+        #     nwalkers, n_varys, log_posterior_func, args=args, pool=pool
+        # )
+        print("Wonderful")
+        # if progress:
+        #     print("Running burn-in ..")
+        #     stdout.flush()
+        # pos, _, _, _ = sampler.run_mcmc(
+        #     pos, burn, store=False, skip_initial_state_check=True, progress=progress
+        # )
+        # sampler.reset()
+        # if progress:
+        #     print("Running sampler ..")
+        #     stdout.flush()
+        # state = sampler.run_mcmc(
+        #     pos,
+        #     steps,
+        #     thin_by=thin,
+        #     skip_initial_state_check=True,
+        #     progress=progress,
+        # )
 
         flatchain = sampler.get_chain(flat=True).reshape((-1, len(vn)))
         pos_i = flatchain[np.argmax(sampler.get_log_prob()), :]
@@ -2196,6 +2215,64 @@ class Dataset(object):
         self.sampler = sampler
         self.__lastfit__ = "emcee"
         return result
+
+    def dynesty_priors(self, cube):
+        theta = np.zeros(len(cube), dtype=np.double)
+
+        # for i in range(0, len(cube)):
+        #     # theta[i] = self.nested_sampling_prior_compute(
+        #     #     cube[i], self.priors[i][0], self.priors[i][2], self.spaces[i])
+        #     theta[i] = 10.0 * (2.0 * cube[i] - 1.0)
+        return 10.0 * (2.0 * cube - 1.0)
+
+    def dynesty_likelihoods(self, theta, **kwargs):
+
+        # chi_out = self(theta, self.include_priors)
+        chi_out = _log_posterior_jitter(theta, **kwargs)
+
+        # if chi_out < -0.5e10:
+        #     return -0.5e10
+        return chi_out
+
+    def nested_sampling_prior_compute(self, val, kind, coeff, space):
+        """
+        In same cases ()
+
+        :param val:
+        :param kind:
+        :param coeff:
+        :param space:
+        :return:
+        """
+
+        if kind == "Uniform":
+            return val * (coeff[1] - coeff[0]) + coeff[0]
+
+        if kind == "Gaussian":
+            if space == "Logarithmic":
+                return np.log2(stats.norm.isf(val, coeff[0], coeff[1]))
+            else:
+                return stats.norm.isf(val, coeff[0], coeff[1])
+
+        # if kind == 'HalfGaussian' or kind=='PositiveHalfGaussian':
+        #    if space == 'Logarithmic':
+        #        return np.log2(stats.truncnorm.isf(val, 0, 20*coeff[1], coeff[0], coeff[1]))
+        #    else:
+        #        return stats.norm.isf(val, 0, 20*coeff[1], coeff[0], coeff[1])
+
+        # if kind == 'NegativeHalfGaussian':
+        #    if space == 'Logarithmic':
+        #        return np.log2(stats.truncnorm.isf(val, -20*coeff[1], 0, coeff[0], coeff[1]))
+        #    else:
+        #        return stats.norm.isf(val, 20*coeff[1], 0, coeff[0], coeff[1])
+
+        elif kind in ["BetaDistribution", "Beta", "beta"]:
+            if space == "Logarithmic":
+                return np.log2(stats.norm.isf(stats.beta.isf(val, coeff[0], coeff[1])))
+            else:
+                return stats.beta.isf(val, coeff[0], coeff[1])
+
+        return splev(val, coeff)
 
     # ----------------------------------------------------------------
 
