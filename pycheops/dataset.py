@@ -2133,28 +2133,31 @@ class Dataset(object):
                 lnpost_i, lnlike_i = log_posterior_func(pos_i, *args)
             pos.append(pos_i)
 
-        # with Pool(self.n_threads) as pool:
-        print(f"Running Dynamic Nested sampling")
-        sampler = dyn.DynamicNestedSampler(
-            self.dynesty_likelihoods,
-            self.dynesty_priors,
-            n_varys,
-            logl_kwargs={
-                "model": model,
-                "time": time,
-                "flux": flux,
-                "flux_err": flux_err,
-                "params": params,
-                "vn": vn,
-                "return_fit": return_fit,
-            },
-            ptform_kwargs={"params": params, "vn": vn},
-        )
-        # TODO add optimisation parameters
-        sampler.run_nested()
-        # sampler = EnsembleSampler(
-        #     nwalkers, n_varys, log_posterior_func, args=args, pool=pool
-        # )
+        with Pool() as pool:
+            print("Setting up the Dynamic Nested Samplig.")
+            sampler = dyn.DynamicNestedSampler(
+                self.dynesty_likelihoods,
+                self.dynesty_priors,
+                n_varys,
+                logl_kwargs={
+                    "model": model,
+                    "time": time,
+                    "flux": flux,
+                    "flux_err": flux_err,
+                    "params": params,
+                    "vn": vn,
+                    "return_fit": return_fit,
+                },
+                pool=pool,
+                queue_size=self.n_threads,
+                ptform_kwargs={"params": params, "vn": vn},
+            )
+            # TODO add optimisation parameters
+            print(f"Running Dynamic Nested sampling")
+            sampler.run_nested()
+            # sampler = EnsembleSampler(
+            #     nwalkers, n_varys, log_posterior_func, args=args, pool=pool
+            # )
         print("Wonderful")
         # if progress:
         #     print("Running burn-in ..")
