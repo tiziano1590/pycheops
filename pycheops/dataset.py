@@ -37,7 +37,8 @@ from astropy.table import Table, MaskedColumn
 import matplotlib.pyplot as plt
 from .instrument import transit_noise
 from ftplib import FTP
-from .models import TransitModel, FactorModel, EclipseModel
+from .models import TransitModel as TransitModelBase
+from .models import TransitModelOversample, FactorModel, EclipseModel
 from lmfit import Parameter, Parameters, minimize, Minimizer, fit_report
 from lmfit import __version__ as _lmfit_version_
 from lmfit import Model
@@ -77,6 +78,7 @@ import os
 from textwrap import fill, indent
 from contextlib import redirect_stdout
 from pathos.pools import ThreadPool as Pool
+from .constants import MAX_EXPOSURE_SEC
 
 try:
     from dace.cheops import Cheops
@@ -1322,6 +1324,9 @@ class Dataset(object):
         glint_scale=None,
         logrhoprior=None,
         log_sigma=None,
+        # Luca Borsato 2021-07-22 
+        # undersampled light-curves with t_exp > 60s -> oversampling to n_over = int(t_exp / 60s)
+        t_exp_s=MAX_EXPOSURE_SEC
     ):
         """
         Fit a transit to the light curve in the current dataset.
@@ -1434,6 +1439,20 @@ class Dataset(object):
             params.add(name="h_2", value=0.6713, vary=False)
         else:
             params["h_2"] = _kw_to_Parameter("h_2", h_2)
+
+        # -- LBO
+        if t_exp_s > MAX_EXPOSURE_SEC:
+            t_exp = t_exp_s/86400.0
+            n_over = int(t_exp_s/MAX_EXPOSURE_SEC) + 1
+            TransitModel = TransitModelOversample
+            # if n_over%2 == 0: n_over += 1
+        else:
+            t_exp = MAX_EXPOSURE_SEC/86400.0
+            n_over = 1
+            TransitModel = TransitModelBase
+        params.add(name="t_exp", value=t_exp, vary=False)
+        params.add(name="n_over", value=n_over, vary=False)
+
         if c is None:
             params.add(name="c", value=1, min=min(flux) / 2, max=2 * max(flux))
         else:
@@ -1484,7 +1503,10 @@ class Dataset(object):
         params.add("q_1", min=0, max=1, expr="(1-h_2)**2")
         params.add("q_2", min=0, max=1, expr="(h_1-h_2)/(1-h_2)")
 
+        # --
+
         model = TransitModel() * self.__factor_model__()
+        # --
 
         if "glint_scale" in params.valuesdict().keys():
             try:
@@ -3831,6 +3853,6 @@ class Dataset(object):
             print(
                 "Decorrelate in",
                 *decorr_params,
-                "using decorr, lmfit_transt, or lmfit_eclipse functions.",
+                "using decorr, lmfit_transit, or lmfit_eclipse functions.",
             )
         return (min_BIC, decorr_params)

@@ -380,6 +380,83 @@ class TransitModel(Model):
         expr = "0.013418*{p:s}aR**3/{p:s}P**2".format(p=self.prefix)
         self.set_param_hint(f'{p}rho', min=0, expr = expr)
 
+#----------------------
+
+class TransitModelOversample(Model):
+    def __init__(self, independent_vars=['t'], prefix='', nan_policy='raise',
+                 **kwargs):
+        kwargs.update({'prefix': prefix, 'nan_policy': nan_policy,
+                       'independent_vars': independent_vars})
+
+        def _transit_func(t, T_0, P, D, W, b, f_c, f_s, h_1, h_2, t_exp, n_over):
+
+            if (D <= 0) or (D > 0.25) or (W <= 0) or (b < 0):
+                return np.ones_like(t)
+            if ((1-abs(f_c)) <= 0) or ((1-abs(f_s)) <= 0):
+                return np.ones_like(t)
+            q1 = (1-h_2)**2
+            if (q1 <= 0) or (q1 >=1): return np.ones_like(t)
+            q2 = (h_1-h_2)/(1-h_2)
+            if (q2 <= 0) or (q2 >=1): return np.ones_like(t)
+            k = np.sqrt(D)
+            q = (1+k)**2 - b**2
+            if q <= 0: return np.ones_like(t)
+            r_star = np.pi*W/np.sqrt(q)
+            q = 1-b**2*r_star**2
+            if q <= 0: return np.ones_like(t)
+            sini = np.sqrt(q)
+            ecc = f_c**2 + f_s**2
+            if ecc > 0.95 : return np.ones_like(t)
+            om = np.arctan2(f_s, f_c)*180/np.pi
+            c2 = 1 - h_1 + h_2
+            a2 = np.log2(c2/h_2)
+
+            # computes oversampled time
+            # each time point is oversampled in n_over points of 60s each spanning the exposure time t_exp
+            # based on batman (L. Kreidberg)
+            hexp  = 0.5*t_exp
+            toff  = np.linspace(-hexp, hexp, n_over)
+            tover = (toff + np.reshape(t, (np.size(t), 1))).flatten()
+            # using the oversampled time to compute z and light-curve
+            z,m = t2z(tover, T_0, P, sini, r_star, ecc, om, returnMask = True)
+            if False in np.isfinite(z): return np.ones_like(t)
+            # Set z values where planet is behind star to a big nominal value
+            z[m]  = 100
+            qpover = qpower2(z, k, c2, a2)
+            # integrates light-curve to original t_exp -> n_over: integrated light-curve
+            qp = np.mean(np.reshape(qpover, (-1, n_over)), axis=1)
+            return qp
+
+        super(TransitModelOversample, self).__init__(_transit_func, **kwargs)
+        self._set_paramhints_prefix()
+
+    def _set_paramhints_prefix(self):
+        p = self.prefix
+        self.set_param_hint(f'{p}P', value=1, min=1e-15)
+        self.set_param_hint(f'{p}D', value=0.01, min=0, max=0.25)
+        self.set_param_hint(f'{p}W', value=0.1, min=0, max=0.3)
+        self.set_param_hint(f'{p}b', value=0.3, min=0, max=1.0)
+        self.set_param_hint(f'{p}f_c', value=0, min=-1, max=1, vary=False)
+        self.set_param_hint(f'{p}f_s', value=0, min=-1, max=1, vary=False)
+        expr = "{p:s}f_c**2 + {p:s}f_s**2".format(p=self.prefix)
+        self.set_param_hint(f'{p}e',min=0,max=1,expr=expr)
+        self.set_param_hint(f'{p}h_1', value=0.7224,min=0,max=1,vary=False)
+        self.set_param_hint(f'{p}h_2', value=0.6713,min=0,max=1,vary=False)
+        # LBo
+        self.set_param_hint(f'{p}t_exp', value=60.0/86400.0, vary=False)
+        self.set_param_hint(f'{p}n_over', value=1, vary=False)
+
+        expr = "(1-{p:s}h_2)**2".format(p=self.prefix)
+        self.set_param_hint(f'{p}q_1',min=0,max=1,expr=expr)
+        expr = "({p:s}h_1-{p:s}h_2)/(1-{p:s}h_2)".format(p=self.prefix)
+        self.set_param_hint(f'{p}q_2',min=0,max=1,expr=expr)
+        expr = "sqrt({p:s}D)".format(p=self.prefix)
+        self.set_param_hint(f'{p}k'.format(p=self.prefix), 
+                expr=expr, min=0, max=0.5)
+        expr ="sqrt((1+{p:s}k)**2-{p:s}b**2)/{p:s}W/pi".format(p=self.prefix)
+        self.set_param_hint(f'{p}aR',min=1, expr=expr)
+        expr = "0.013418*{p:s}aR**3/{p:s}P**2".format(p=self.prefix)
+        self.set_param_hint(f'{p}rho', min=0, expr = expr)
 
 #----------------------
 
