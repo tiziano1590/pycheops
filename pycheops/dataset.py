@@ -723,7 +723,7 @@ class Dataset(object):
     def __setstate__(self, state):
         def reconstruct_model(model_repr, state):
             if "_transit_func" in model_repr:
-                model = TransitModel() * self.__factor_model__()
+                model = TransitModelBase() * self.__factor_model__()
             elif "_eclipse_func" in model_repr:
                 model = EclipseModel() * self.__factor_model__()
             if "glint_func" in model_repr:
@@ -1324,9 +1324,9 @@ class Dataset(object):
         glint_scale=None,
         logrhoprior=None,
         log_sigma=None,
-        # Luca Borsato 2021-07-22 
+        # Luca Borsato 2021-07-22
         # undersampled light-curves with t_exp > 60s -> oversampling to n_over = int(t_exp / 60s)
-        t_exp_s=MAX_EXPOSURE_SEC
+        t_exp_s=MAX_EXPOSURE_SEC,
     ):
         """
         Fit a transit to the light curve in the current dataset.
@@ -1442,12 +1442,12 @@ class Dataset(object):
 
         # -- LBO
         if t_exp_s > MAX_EXPOSURE_SEC:
-            t_exp = t_exp_s/86400.0
-            n_over = int(t_exp_s/MAX_EXPOSURE_SEC) + 1
+            t_exp = t_exp_s / 86400.0
+            n_over = int(t_exp_s / MAX_EXPOSURE_SEC) + 1
             TransitModel = TransitModelOversample
             # if n_over%2 == 0: n_over += 1
         else:
-            t_exp = MAX_EXPOSURE_SEC/86400.0
+            t_exp = MAX_EXPOSURE_SEC / 86400.0
             n_over = 1
             TransitModel = TransitModelBase
         params.add(name="t_exp", value=t_exp, vary=False)
@@ -1497,7 +1497,7 @@ class Dataset(object):
         params.add("sini", expr="sqrt(1 - (b/aR)**2)")
         # Avoid use of aR in this expr for logrho - breaks error propogation.
         expr = "log10(4.3275e-4*((1+k)**2-b**2)**1.5/W**3/P**2)"
-        params.add("logrho", expr=expr, min=-9, max=6)
+        params.add("logrho", expr=expr, min=-9, max=6)  # P as ufunc can break the code
         params["logrho"].user_data = logrhoprior
         params.add("e", min=0, max=1, expr="f_c**2 + f_s**2")
         params.add("q_1", min=0, max=1, expr="(1-h_2)**2")
