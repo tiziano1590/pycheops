@@ -25,6 +25,7 @@ Dataset
 """
 
 from __future__ import absolute_import, division, print_function, unicode_literals
+from IPython.core.display import display
 import numpy as np
 import tarfile
 from zipfile import ZipFile
@@ -2769,7 +2770,7 @@ class Dataset(object):
                 if len(x) == nm:
                     return x
                 elif len(x) > nm:
-                    return x[random_sample(range(len(x)), nm)]
+                    return x[np.random.sample(range(len(x)), nm)]
                 else:
                     return x[(np.random.random(nm) * len(x + 1)).astype(int)]
             elif isinstance(x, tuple):
