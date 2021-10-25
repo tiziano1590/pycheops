@@ -46,6 +46,7 @@ from lmfit import Model
 from scipy.interpolate import interp1d, LSQUnivariateSpline
 import matplotlib.pyplot as plt
 from emcee import EnsembleSampler
+from ultranest import ReactiveNestedSampler
 import corner
 from copy import copy, deepcopy
 from celerite2 import terms, GaussianProcess
@@ -2011,6 +2012,212 @@ class Dataset(object):
         report += "\n    pycheops   : %s" % __version__
         report += "\n    lmfit      : %s" % _lmfit_version_
         return report
+
+    # ----------------------------------------------------------------
+    def ultranest_sampler(
+        self,
+        params=None,
+        steps=128,
+        nwalkers=64,
+        burn=256,
+        thin=1,
+        log_sigma=None,
+        add_shoterm=False,
+        log_omega0=None,
+        log_S0=None,
+        log_Q=None,
+        init_scale=1e-2,
+        progress=True,
+    ):
+        """
+        If you only want to store and yield 1-in-thin samples in the chain, set
+        thin to an integer greater than 1. When this is set, thin*steps will be
+        made and the chains returned with have "steps" values per walker.
+        """
+
+        try:
+            time = np.array(self.lc["time"])
+            flux = np.array(self.lc["flux"])
+            flux_err = np.array(self.lc["flux_err"])
+        except AttributeError:
+            raise AttributeError("Use get_lightcurve() to load data first.")
+
+        try:
+            model = self.model
+        except AttributeError:
+            raise AttributeError("Use lmfit_transit() or lmfit_eclipse() first.")
+
+        # Make a copy of the lmfit Minimizer result as a template for the
+        # output of this method
+        result = deepcopy(self.lmfit)
+        result.method = "emcee"
+        # Remove components on result not relevant for emcee
+        result.status = None
+        result.success = None
+        result.message = None
+        result.ier = None
+        result.lmdif_message = None
+
+        if params is None:
+            params = self.lmfit.params.copy()
+        k = params.valuesdict().keys()
+        if add_shoterm:
+            if "log_S0" in k:
+                pass
+            elif log_S0 is None:
+                params.add("log_S0", value=-12, min=-30, max=0)
+            else:
+                params["log_S0"] = _kw_to_Parameter("log_S0", log_S0)
+            # For time in days, and the default value of Q=1/sqrt(2),
+            # log_omega0=8  is a correlation length of about 30s and
+            # -2.3 is about 10 days.
+            if "log_omega0" in k:
+                pass
+            elif log_omega0 is None:
+                params.add("log_omega0", value=3, min=-2.3, max=8)
+            else:
+                lw0 = _kw_to_Parameter("log_omega0", log_omega0)
+                params["log_omega0"] = lw0
+            if "log_Q" in params:
+                pass
+            elif log_Q is None:
+                params.add("log_Q", value=np.log(1 / np.sqrt(2)), vary=False)
+            else:
+                params["log_Q"] = _kw_to_Parameter("log_Q", log_Q)
+
+        if "log_sigma" in k:
+            pass
+        elif log_sigma is None:
+            if not "log_sigma" in params:
+                params.add("log_sigma", value=-10, min=-16, max=-1)
+                params["log_sigma"].stderr = 1
+        else:
+            params["log_sigma"] = _kw_to_Parameter("log_sigma", log_sigma)
+        params.add("sigma_w", expr="exp(log_sigma)*1e6")
+
+        vv, vs, vn = [], [], []
+        for p in params:
+            if params[p].vary:
+                vn.append(p)
+                vv.append(params[p].value)
+                if params[p].stderr is None:
+                    if params[p].user_data is None:
+                        vs.append(0.01 * (params[p].max - params[p].min))
+                    else:
+                        vs.append(params[p].user_data.s)
+                else:
+                    if np.isfinite(params[p].stderr):
+                        vs.append(params[p].stderr)
+                    else:
+                        vs.append(0.01 * (params[p].max - params[p].min))
+
+        result.var_names = vn
+        result.init_vals = vv
+        result.init_values = {}
+        for n, v in zip(vn, vv):
+            result.init_values[n] = v
+
+        vv = np.array(vv)
+        vs = np.array(vs)
+
+        args = (model, time, flux, flux_err, params, vn)
+        p = list(params.keys())
+        if "log_S0" in p and "log_omega0" in p and "log_Q" in p:
+            log_posterior_func = _log_posterior_SHOTerm
+            self.gp = True
+        else:
+            log_posterior_func = _log_posterior_jitter
+            self.gp = False
+        return_fit = False
+        args += (return_fit,)
+
+        # Initialize sampler positions ensuring all walkers produce valid
+        # function values.
+        pos = []
+        n_varys = len(vv)
+
+        for i in range(nwalkers):
+            params_tmp = params.copy()
+            lnpost_i = -np.inf
+            while lnpost_i == -np.inf:
+                pos_i = vv + vs * np.random.randn(n_varys) * init_scale
+                lnpost_i, lnlike_i = log_posterior_func(pos_i, *args)
+            pos.append(pos_i)
+
+        with Pool(self.n_threads) as pool:
+            print(f"Running MCMC with {self.n_threads} cores")
+            sampler = EnsembleSampler(
+                nwalkers, n_varys, log_posterior_func, args=args, pool=pool
+            )
+            if progress:
+                print("Running burn-in ..")
+                stdout.flush()
+            pos, _, _, _ = sampler.run_mcmc(
+                pos, burn, store=False, skip_initial_state_check=True, progress=progress
+            )
+            sampler.reset()
+            if progress:
+                print("Running sampler ..")
+                stdout.flush()
+            state = sampler.run_mcmc(
+                pos,
+                steps,
+                thin_by=thin,
+                skip_initial_state_check=True,
+                progress=progress,
+            )
+
+        flatchain = sampler.get_chain(flat=True).reshape((-1, len(vn)))
+        pos_i = flatchain[np.argmax(sampler.get_log_prob()), :]
+        fit = log_posterior_func(
+            pos_i, model, time, flux, flux_err, params, vn, return_fit=True
+        )
+
+        # Use scaled resiudals for consistency with lmfit
+        result.residual = (flux - fit) / flux_err
+        result.bestfit = fit
+        result.chain = flatchain
+        # Store median and stanadrd error of PPD in result.params
+        # Store best fit in result.parbest
+        parbest = params.copy()
+        quantiles = np.percentile(flatchain, [15.87, 50, 84.13], axis=0)
+        for i, n in enumerate(vn):
+            std_l, median, std_u = quantiles[:, i]
+            params[n].value = median
+            params[n].stderr = 0.5 * (std_u - std_l)
+            params[n].correl = {}
+            parbest[n].value = pos_i[i]
+            parbest[n].stderr = 0.5 * (std_u - std_l)
+            parbest[n].correl = {}
+        result.params = params
+        result.params_best = parbest
+        corrcoefs = np.corrcoef(flatchain.T)
+        for i, n in enumerate(vn):
+            for j, n2 in enumerate(vn):
+                if i != j:
+                    result.params[n].correl[n2] = corrcoefs[i, j]
+                    result.params_best[n].correl[n2] = corrcoefs[i, j]
+        result.lnprob = np.copy(sampler.get_log_prob())
+        result.errorbars = True
+        result.nvarys = n_varys
+        af = sampler.acceptance_fraction.mean()
+        result.acceptance_fraction = af
+        result.nfev = int(thin * nwalkers * steps / af)
+        result.thin = thin
+        result.ndata = len(time)
+        result.nfree = len(time) - n_varys
+        result.chisqr = np.sum((flux - fit) ** 2 / flux_err ** 2)
+        result.redchi = result.chisqr / (len(time) - n_varys)
+        loglmax = np.max(sampler.get_blobs())
+        result.lnlike = loglmax
+        result.aic = 2 * n_varys - 2 * loglmax
+        result.bic = np.log(len(time)) * n_varys - 2 * loglmax
+        result.covar = np.cov(flatchain.T)
+        result.rms = (flux - fit).std()
+        self.emcee = result
+        self.sampler = sampler
+        self.__lastfit__ = "emcee"
+        return result
 
     # ----------------------------------------------------------------
 
