@@ -47,6 +47,7 @@ from scipy.interpolate import interp1d, LSQUnivariateSpline
 import matplotlib.pyplot as plt
 from emcee import EnsembleSampler
 from ultranest import ReactiveNestedSampler
+from scipy.special import ndtri
 import corner
 from copy import copy, deepcopy
 from celerite2 import terms, GaussianProcess
@@ -86,6 +87,9 @@ try:
     from dace.cheops import Cheops
 except ModuleNotFoundError:
     pass
+
+LN2PI = np.log(2.0 * np.pi)
+LNSIGMA = np.log(10)
 
 _file_key_re = re.compile(r"CH_PR(\d{2})(\d{4})_TG(\d{4})(\d{2})_V(\d{4})")
 
@@ -137,7 +141,7 @@ def _glint_func(t, glint_scale, f_theta=None, f_glint=None):
 # ---
 
 
-def _make_trial_params(pos, params, vn):
+def _make_trial_params(pos=None, params=None, vn=None):
     # Create a copy of the params object with the parameter values give in
     # list vn replaced with trial values from array pos.
     # Also returns the contribution to the log-likelihood of the parameter
@@ -2013,6 +2017,37 @@ class Dataset(object):
         report += "\n    lmfit      : %s" % _lmfit_version_
         return report
 
+    ### ULTRANEST FUNCTIONS
+    def ultra_prior_transform(self, theta, **kwargs):
+        """
+        A function defining the transform between the paramettrisation in the unit hypercube to the true parameters.
+
+
+        Args:
+            theta (list): a list/array containing the parameters
+        Returns:
+            list: a new list/array with the transformed parameters.
+        """
+        pars = np.array([t for t in theta])
+
+        pmins = np.array([0 for t in theta])  # TODO change with input bounds
+        pmaxs = np.array([10 for t in theta])  # TODO change with input bounds
+
+        pmus = np.array([0 for t in theta])  # TODO change with input bounds
+        psigmas = np.array([10 for t in theta])  # TODO change with input bounds
+
+        priors = [pmus[i] + psigmas[i] * ndtri(pars[i]) for i, _ in enumerate(pars)]
+
+        return np.array(priors)
+
+    def ultra_loglikelihood(self, theta, **kwargs):
+        """
+        The log likelihood function.
+        """
+        pars = np.array([t for t in theta])
+
+        return True
+
     # ----------------------------------------------------------------
     def ultranest_sampler(
         self,
@@ -2120,52 +2155,146 @@ class Dataset(object):
         vv = np.array(vv)
         vs = np.array(vs)
 
+        # Initialize sampler positions ensuring all walkers produce valid
+        # function values.
+        # pos = []
+        n_varys = len(vv)
+        params_tmp = params.copy()
+        pos = vv + vs * np.random.randn(n_varys) * init_scale
+        # pos.append(pos_i)
+
+        # Defines prior
+
+        def make_trial_params(params=params, pos=pos, vn=vn):
+            # Create a copy of the params object with the parameter values give in
+            # list vn replaced with trial values from array pos.
+            # Also returns the contribution to the log-likelihood of the parameter
+            # values.
+            # Return value is parcopy, lnprior
+            # If any of the parameters are out of range, returns None, -inf
+            # parcopy = params.copy()
+            # lnprior = 0
+            # for i, p in enumerate(vn):
+            #     v = pos[i]
+            #     if (v < parcopy[p].min) or (v > parcopy[p].max):
+            #         return None, -np.inf
+            #     parcopy[p].value = v
+
+            # lnprior = _log_prior(parcopy["D"], parcopy["W"], parcopy["b"])
+            # if not np.isfinite(lnprior):
+            #     return None, -np.inf
+
+            # # Also check parameter range here so we catch "derived" parameters
+            # # that are out of range.
+            # for p in parcopy:
+            #     v = parcopy[p].value
+            #     if (v < parcopy[p].min) or (v > parcopy[p].max):
+            #         return None, -np.inf
+            #     if np.isnan(v):
+            #         return None, -np.inf
+            #     u = parcopy[p].user_data
+            #     if isinstance(u, UFloat):
+            #         lnprior += -0.5 * ((u.n - v) / u.s) ** 2
+            # if not np.isfinite(lnprior):
+            #     return None, -np.inf
+
+            # return parcopy, lnprior
+            pars = np.array([t for t in pos])
+
+            pmins = np.array([params[par].min for par in list(params.keys())])
+            pmaxs = np.array([params[par].max for par in list(params.keys())])
+
+            # pmus = np.array([0 for t in theta])  # TODO change with input bounds
+            # psigmas = np.array([10 for t in theta])  # TODO change with input bounds
+
+            priors = [
+                pars[i] * (pmaxs[i] - pmins[i]) + pmins[i] for i, _ in enumerate(pars)
+            ]
+
+            return np.array(priors)
+
+        def ultra_log_prior_func(pos):
+            lnprior = make_trial_params(params=params, pos=pos, vn=vn)
+            return lnprior
+
+        # Defines likelihood
+        def ultra_log_posterior_jitter(pos):
+
+            parcopy = params_tmp.copy()
+
+            fit = model.eval(parcopy, t=time)
+            if return_fit:
+                return fit
+
+            if False in np.isfinite(fit):
+                return 0
+
+            jitter = np.exp(parcopy["log_sigma"].value)
+            s2 = flux_err ** 2 + jitter ** 2
+            lnlike = -0.5 * (np.sum((flux - fit) ** 2 / s2 + np.log(2 * np.pi * s2)))
+            return lnlike
+
+        # ----
+
+        def ultra_log_posterior_SHOTerm(pos):
+
+            parcopy = np.copy(params)
+            if parcopy is None:
+                return -1
+
+            fit = model.eval(parcopy, t=time)
+            if return_fit:
+                return fit
+
+            if False in np.isfinite(fit):
+                return -1
+
+            resid = flux - fit
+            kernel = SHOTerm(
+                S0=np.exp(parcopy["log_S0"].value),
+                Q=np.exp(parcopy["log_Q"].value),
+                w0=np.exp(parcopy["log_omega0"].value),
+            )
+            gp = GaussianProcess(kernel, mean=0)
+            yvar = flux_err ** 2 + np.exp(2 * parcopy["log_sigma"].value)
+            gp.compute(time, diag=yvar, quiet=True)
+            lnlike = gp.log_likelihood(resid)
+            return lnlike
+
         args = (model, time, flux, flux_err, params, vn)
         p = list(params.keys())
         if "log_S0" in p and "log_omega0" in p and "log_Q" in p:
-            log_posterior_func = _log_posterior_SHOTerm
+            ultra_log_posterior_func = ultra_log_posterior_SHOTerm
             self.gp = True
         else:
-            log_posterior_func = _log_posterior_jitter
+            ultra_log_posterior_func = ultra_log_posterior_jitter
             self.gp = False
         return_fit = False
         args += (return_fit,)
 
-        # Initialize sampler positions ensuring all walkers produce valid
-        # function values.
-        pos = []
-        n_varys = len(vv)
-
-        for i in range(nwalkers):
-            params_tmp = params.copy()
-            lnpost_i = -np.inf
-            while lnpost_i == -np.inf:
-                pos_i = vv + vs * np.random.randn(n_varys) * init_scale
-                lnpost_i, lnlike_i = log_posterior_func(pos_i, *args)
-            pos.append(pos_i)
-
-        with Pool(self.n_threads) as pool:
-            print(f"Running MCMC with {self.n_threads} cores")
-            sampler = EnsembleSampler(
-                nwalkers, n_varys, log_posterior_func, args=args, pool=pool
-            )
-            if progress:
-                print("Running burn-in ..")
-                stdout.flush()
-            pos, _, _, _ = sampler.run_mcmc(
-                pos, burn, store=False, skip_initial_state_check=True, progress=progress
-            )
-            sampler.reset()
-            if progress:
-                print("Running sampler ..")
-                stdout.flush()
-            state = sampler.run_mcmc(
-                pos,
-                steps,
-                thin_by=thin,
-                skip_initial_state_check=True,
-                progress=progress,
-            )
+        # with Pool(self.n_threads) as pool:
+        print(f"Running Ultranest with {self.n_threads} cores")
+        sampler = ReactiveNestedSampler(
+            p, ultra_log_posterior_func, ultra_log_prior_func
+        )
+        sampler.run(dlogz=0.5)
+        # if progress:
+        #     print("Running burn-in ..")
+        #     stdout.flush()
+        # pos, _, _, _ = sampler.run_mcmc(
+        #     pos, burn, store=False, skip_initial_state_check=True, progress=progress
+        # )
+        # sampler.reset()
+        # if progress:
+        #     print("Running sampler ..")
+        #     stdout.flush()
+        # state = sampler.run_mcmc(
+        #     pos,
+        #     steps,
+        #     thin_by=thin,
+        #     skip_initial_state_check=True,
+        #     progress=progress,
+        # )
 
         flatchain = sampler.get_chain(flat=True).reshape((-1, len(vn)))
         pos_i = flatchain[np.argmax(sampler.get_log_prob()), :]
