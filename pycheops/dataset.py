@@ -82,6 +82,7 @@ from textwrap import fill, indent
 from contextlib import redirect_stdout
 from pathos.pools import ThreadPool as Pool
 from .constants import MAX_EXPOSURE_SEC
+from mpi4py import MPI
 
 try:
     from dace.cheops import Cheops
@@ -2052,10 +2053,11 @@ class Dataset(object):
     def ultranest_sampler(
         self,
         params=None,
-        steps=128,
-        nwalkers=64,
-        burn=256,
-        thin=1,
+        live_points=500,
+        tol=0.5,
+        cluster_num_live_points=40,
+        logdir=None,
+        resume="overwrite",
         log_sigma=None,
         add_shoterm=False,
         log_omega0=None,
@@ -2157,11 +2159,9 @@ class Dataset(object):
 
         # Initialize sampler positions ensuring all walkers produce valid
         # function values.
-        # pos = []
         n_varys = len(vv)
         params_tmp = params.copy()
         pos = vv + vs * np.random.randn(n_varys) * init_scale
-        # pos.append(pos_i)
 
         # Defines prior
 
@@ -2170,52 +2170,19 @@ class Dataset(object):
             # list vn replaced with trial values from array pos.
             # Also returns the contribution to the log-likelihood of the parameter
             # values.
-            # Return value is parcopy, lnprior
-            # If any of the parameters are out of range, returns None, -inf
-            # parcopy = params.copy()
-            # lnprior = 0
-            # for i, p in enumerate(vn):
-            #     v = pos[i]
-            #     if (v < parcopy[p].min) or (v > parcopy[p].max):
-            #         return None, -np.inf
-            #     parcopy[p].value = v
+            # Return value is priors
 
-            # lnprior = _log_prior(parcopy["D"], parcopy["W"], parcopy["b"])
-            # if not np.isfinite(lnprior):
-            #     return None, -np.inf
-
-            # # Also check parameter range here so we catch "derived" parameters
-            # # that are out of range.
-            # for p in parcopy:
-            #     v = parcopy[p].value
-            #     if (v < parcopy[p].min) or (v > parcopy[p].max):
-            #         return None, -np.inf
-            #     if np.isnan(v):
-            #         return None, -np.inf
-            #     u = parcopy[p].user_data
-            #     if isinstance(u, UFloat):
-            #         lnprior += -0.5 * ((u.n - v) / u.s) ** 2
-            # if not np.isfinite(lnprior):
-            #     return None, -np.inf
-
-            # return parcopy, lnprior
             pars = np.array([t for t in pos])
 
             pmins = np.array([params[par].min for par in list(params.keys())])
             pmaxs = np.array([params[par].max for par in list(params.keys())])
 
-            pmins[np.where(pmins == -np.inf)] = -1e50
-            pmaxs[np.where(pmaxs == np.inf)] = 1e50
-
-            # pmus = np.array([0 for t in theta])  # TODO change with input bounds
-            # psigmas = np.array([10 for t in theta])  # TODO change with input bounds
+            pmins[np.where(pmins == -np.inf)] = 100
+            pmaxs[np.where(pmaxs == np.inf)] = -100
 
             priors = [
                 pars[i] * (pmaxs[i] - pmins[i]) + pmins[i] for i, _ in enumerate(pars)
             ]
-
-            # for i, _ in enumerate(pars):
-            #     print(f"{p[i]} min: {pmins[i]}\n{p[i]} max: {pmaxs[i]}\n\n")
 
             return np.array(priors)
 
@@ -2247,9 +2214,10 @@ class Dataset(object):
 
         def ultra_log_posterior_SHOTerm(pos):
 
-            parcopy = np.copy(params)
-            if parcopy is None:
-                return -1
+            parcopy = params_tmp.copy()
+
+            for j, key in enumerate(list(parcopy.keys())):
+                parcopy[key].value = pos[j]
 
             fit = model.eval(parcopy, t=time)
             if return_fit:
@@ -2281,29 +2249,19 @@ class Dataset(object):
         return_fit = False
         args += (return_fit,)
 
-        # with Pool(self.n_threads) as pool:
-        print(f"Running Ultranest with {self.n_threads} cores")
+        print(f"Running Ultranest")
         sampler = ReactiveNestedSampler(
-            p, ultra_log_posterior_func, ultra_log_prior_func
+            p,
+            ultra_log_posterior_func,
+            ultra_log_prior_func,
+            log_dir=logdir,
+            resume=resume,
         )
-        sampler.run(dlogz=0.5)
-        # if progress:
-        #     print("Running burn-in ..")
-        #     stdout.flush()
-        # pos, _, _, _ = sampler.run_mcmc(
-        #     pos, burn, store=False, skip_initial_state_check=True, progress=progress
-        # )
-        # sampler.reset()
-        # if progress:
-        #     print("Running sampler ..")
-        #     stdout.flush()
-        # state = sampler.run_mcmc(
-        #     pos,
-        #     steps,
-        #     thin_by=thin,
-        #     skip_initial_state_check=True,
-        #     progress=progress,
-        # )
+        sampler.run(
+            min_num_live_points=live_points,
+            dlogz=tol,
+            cluster_num_live_points=cluster_num_live_points,
+        )
 
         flatchain = sampler.get_chain(flat=True).reshape((-1, len(vn)))
         pos_i = flatchain[np.argmax(sampler.get_log_prob()), :]
