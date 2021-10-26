@@ -2204,12 +2204,18 @@ class Dataset(object):
             pmins = np.array([params[par].min for par in list(params.keys())])
             pmaxs = np.array([params[par].max for par in list(params.keys())])
 
+            pmins[np.where(pmins == -np.inf)] = -1e50
+            pmaxs[np.where(pmaxs == np.inf)] = 1e50
+
             # pmus = np.array([0 for t in theta])  # TODO change with input bounds
             # psigmas = np.array([10 for t in theta])  # TODO change with input bounds
 
             priors = [
                 pars[i] * (pmaxs[i] - pmins[i]) + pmins[i] for i, _ in enumerate(pars)
             ]
+
+            # for i, _ in enumerate(pars):
+            #     print(f"{p[i]} min: {pmins[i]}\n{p[i]} max: {pmaxs[i]}\n\n")
 
             return np.array(priors)
 
@@ -2221,6 +2227,9 @@ class Dataset(object):
         def ultra_log_posterior_jitter(pos):
 
             parcopy = params_tmp.copy()
+
+            for j, key in enumerate(list(parcopy.keys())):
+                parcopy[key].value = pos[j]
 
             fit = model.eval(parcopy, t=time)
             if return_fit:
