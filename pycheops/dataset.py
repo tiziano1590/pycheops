@@ -2177,8 +2177,8 @@ class Dataset(object):
             pmins = np.array([params[par].min for par in list(params.keys())])
             pmaxs = np.array([params[par].max for par in list(params.keys())])
 
-            pmins[np.where(pmins == -np.inf)] = 10
-            pmaxs[np.where(pmaxs == np.inf)] = -10
+            pmins[np.where(pmins == -np.inf)] = -10
+            pmaxs[np.where(pmaxs == np.inf)] = 10
 
             priors = [
                 pars[i] * (pmaxs[i] - pmins[i]) + pmins[i] for i, _ in enumerate(pars)
@@ -2190,10 +2190,12 @@ class Dataset(object):
             lnprior = make_trial_params(params=params, pos=pos, vn=vn)
             return lnprior
 
+        parcopy = params_tmp.copy()
+
         # Defines likelihood
         def ultra_log_posterior_jitter(pos):
 
-            parcopy = params_tmp.copy()
+            # parcopy = params_tmp.copy()
 
             for j, key in enumerate(list(parcopy.keys())):
                 parcopy[key].value = pos[j]
@@ -2214,7 +2216,7 @@ class Dataset(object):
 
         def ultra_log_posterior_SHOTerm(pos):
 
-            parcopy = params_tmp.copy()
+            # parcopy = params_tmp.copy()
 
             for j, key in enumerate(list(parcopy.keys())):
                 parcopy[key].value = pos[j]
