@@ -47,6 +47,7 @@ from scipy.interpolate import interp1d, LSQUnivariateSpline
 import matplotlib.pyplot as plt
 from emcee import EnsembleSampler
 from ultranest import ReactiveNestedSampler
+from ultranest.stepsampler import RegionSliceSampler
 from scipy.special import ndtri
 import corner
 from copy import copy, deepcopy
@@ -2058,6 +2059,7 @@ class Dataset(object):
         cluster_num_live_points=40,
         logdir=None,
         resume="overwrite",
+        adaptive_nsteps=False,
         log_sigma=None,
         add_shoterm=False,
         log_omega0=None,
@@ -2165,7 +2167,7 @@ class Dataset(object):
 
         # Defines prior
 
-        def make_trial_params(params=params, pos=pos, vn=vn):
+        def make_trial_params(params=params, pos=pos):
             # Create a copy of the params object with the parameter values give in
             # list vn replaced with trial values from array pos.
             # Also returns the contribution to the log-likelihood of the parameter
@@ -2177,17 +2179,15 @@ class Dataset(object):
             pmins = np.array([params[par].min for par in list(params.keys())])
             pmaxs = np.array([params[par].max for par in list(params.keys())])
 
-            pmins[np.where(pmins == -np.inf)] = -10
-            pmaxs[np.where(pmaxs == np.inf)] = 10
+            pmins[np.where(pmins == -np.inf)] = -1e4  # float("-inf")
+            pmaxs[np.where(pmaxs == np.inf)] = 1e4  # float("inf")
 
-            priors = [
-                pars[i] * (pmaxs[i] - pmins[i]) + pmins[i] for i, _ in enumerate(pars)
-            ]
+            priors = pars * (pmaxs - pmins) + pmins
 
             return np.array(priors)
 
         def ultra_log_prior_func(pos):
-            lnprior = make_trial_params(params=params, pos=pos, vn=vn)
+            lnprior = make_trial_params(params=params, pos=pos)
             return lnprior
 
         parcopy = params_tmp.copy()
@@ -2201,11 +2201,11 @@ class Dataset(object):
                 parcopy[key].value = pos[j]
 
             fit = model.eval(parcopy, t=time)
-            if return_fit:
-                return fit
+            # if return_fit:
+            #     return fit
 
-            if False in np.isfinite(fit):
-                return 0
+            # if False in np.isfinite(fit):
+            #     return 0
 
             jitter = np.exp(parcopy["log_sigma"].value)
             s2 = flux_err ** 2 + jitter ** 2
@@ -2222,11 +2222,11 @@ class Dataset(object):
                 parcopy[key].value = pos[j]
 
             fit = model.eval(parcopy, t=time)
-            if return_fit:
-                return fit
+            # if return_fit:
+            #     return fit
 
-            if False in np.isfinite(fit):
-                return -1
+            # if False in np.isfinite(fit):
+            #     return -1
 
             resid = flux - fit
             kernel = SHOTerm(
@@ -2258,64 +2258,27 @@ class Dataset(object):
             ultra_log_prior_func,
             log_dir=logdir,
             resume=resume,
+            draw_multiple=True,
+            storage_backend="hdf5",
         )
+
+        nsteps = 2 * len(p)
+
+        sampler.stepsampler = RegionSliceSampler(
+            nsteps=nsteps, adaptive_nsteps=adaptive_nsteps
+        )
+
         sampler.run(
             min_num_live_points=live_points,
             dlogz=tol,
             cluster_num_live_points=cluster_num_live_points,
         )
 
-        flatchain = sampler.get_chain(flat=True).reshape((-1, len(vn)))
-        pos_i = flatchain[np.argmax(sampler.get_log_prob()), :]
-        fit = log_posterior_func(
-            pos_i, model, time, flux, flux_err, params, vn, return_fit=True
-        )
-
-        # Use scaled resiudals for consistency with lmfit
-        result.residual = (flux - fit) / flux_err
-        result.bestfit = fit
-        result.chain = flatchain
-        # Store median and stanadrd error of PPD in result.params
-        # Store best fit in result.parbest
-        parbest = params.copy()
-        quantiles = np.percentile(flatchain, [15.87, 50, 84.13], axis=0)
-        for i, n in enumerate(vn):
-            std_l, median, std_u = quantiles[:, i]
-            params[n].value = median
-            params[n].stderr = 0.5 * (std_u - std_l)
-            params[n].correl = {}
-            parbest[n].value = pos_i[i]
-            parbest[n].stderr = 0.5 * (std_u - std_l)
-            parbest[n].correl = {}
-        result.params = params
-        result.params_best = parbest
-        corrcoefs = np.corrcoef(flatchain.T)
-        for i, n in enumerate(vn):
-            for j, n2 in enumerate(vn):
-                if i != j:
-                    result.params[n].correl[n2] = corrcoefs[i, j]
-                    result.params_best[n].correl[n2] = corrcoefs[i, j]
-        result.lnprob = np.copy(sampler.get_log_prob())
-        result.errorbars = True
-        result.nvarys = n_varys
-        af = sampler.acceptance_fraction.mean()
-        result.acceptance_fraction = af
-        result.nfev = int(thin * nwalkers * steps / af)
-        result.thin = thin
-        result.ndata = len(time)
-        result.nfree = len(time) - n_varys
-        result.chisqr = np.sum((flux - fit) ** 2 / flux_err ** 2)
-        result.redchi = result.chisqr / (len(time) - n_varys)
-        loglmax = np.max(sampler.get_blobs())
-        result.lnlike = loglmax
-        result.aic = 2 * n_varys - 2 * loglmax
-        result.bic = np.log(len(time)) * n_varys - 2 * loglmax
-        result.covar = np.cov(flatchain.T)
-        result.rms = (flux - fit).std()
-        self.emcee = result
-        self.sampler = sampler
-        self.__lastfit__ = "emcee"
-        return result
+        self.__lastfit__ = "ultranest"
+        sampler.plot_run()
+        sampler.plot_trace()
+        sampler.plot_corner()
+        return sampler
 
     # ----------------------------------------------------------------
 
