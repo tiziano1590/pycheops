@@ -2179,8 +2179,8 @@ class Dataset(object):
             pmins = np.array([params[par].min for par in list(params.keys())])
             pmaxs = np.array([params[par].max for par in list(params.keys())])
 
-            pmins[np.where(pmins == -np.inf)] = -1e4  # float("-inf")
-            pmaxs[np.where(pmaxs == np.inf)] = 1e4  # float("inf")
+            pmins[np.where(pmins == -np.inf)] = -1e50  # float("-inf")
+            pmaxs[np.where(pmaxs == np.inf)] = 1e50  # float("inf")
 
             priors = pars * (pmaxs - pmins) + pmins
 
