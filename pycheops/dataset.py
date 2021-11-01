@@ -2163,11 +2163,20 @@ class Dataset(object):
         # function values.
         n_varys = len(vv)
         params_tmp = params.copy()
+
+        vary_params = params.copy()
+        for key in list(vary_params.keys()):
+            if not vary_params[key].vary:
+                del vary_params[key]
+
         pos = vv + vs * np.random.randn(n_varys) * init_scale
+
+        # TODO select parameters to put in nested sampler
+        # by checking if it varies, i.e. params[key].vary = True
 
         # Defines prior
 
-        def make_trial_params(params=params, pos=pos):
+        def make_trial_params(pos=pos):
             # Create a copy of the params object with the parameter values give in
             # list vn replaced with trial values from array pos.
             # Also returns the contribution to the log-likelihood of the parameter
@@ -2176,18 +2185,18 @@ class Dataset(object):
 
             pars = np.array([t for t in pos])
 
-            pmins = np.array([params[par].min for par in list(params.keys())])
-            pmaxs = np.array([params[par].max for par in list(params.keys())])
+            pmins = np.array([vary_params[par].min for par in list(vary_params.keys())])
+            pmaxs = np.array([vary_params[par].max for par in list(vary_params.keys())])
 
-            pmins[np.where(pmins == -np.inf)] = -1e50  # float("-inf")
-            pmaxs[np.where(pmaxs == np.inf)] = 1e50  # float("inf")
+            pmins[np.where(pmins == -np.inf)] = -1e3  # float("-inf")
+            pmaxs[np.where(pmaxs == np.inf)] = 1e3  # float("inf")
 
             priors = pars * (pmaxs - pmins) + pmins
 
             return np.array(priors)
 
         def ultra_log_prior_func(pos):
-            lnprior = make_trial_params(params=params, pos=pos)
+            lnprior = make_trial_params(pos=pos)
             return lnprior
 
         parcopy = params_tmp.copy()
@@ -2196,9 +2205,10 @@ class Dataset(object):
         def ultra_log_posterior_jitter(pos):
 
             # parcopy = params_tmp.copy()
-
-            for j, key in enumerate(list(parcopy.keys())):
-                parcopy[key].value = pos[j]
+            for j, key in enumerate(list(vary_params.keys())):
+                parcopy[key].set(value=pos[j])
+            #
+            # print(parcopy)
 
             fit = model.eval(parcopy, t=time)
             # if return_fit:
@@ -2218,8 +2228,8 @@ class Dataset(object):
 
             # parcopy = params_tmp.copy()
 
-            for j, key in enumerate(list(parcopy.keys())):
-                parcopy[key].value = pos[j]
+            for j, key in enumerate(list(vary_params.keys())):
+                parcopy[key].set(value=pos[j])
 
             fit = model.eval(parcopy, t=time)
             # if return_fit:
@@ -2241,7 +2251,7 @@ class Dataset(object):
             return lnlike
 
         args = (model, time, flux, flux_err, params, vn)
-        p = list(params.keys())
+        p = list(vary_params.keys())
         if "log_S0" in p and "log_omega0" in p and "log_Q" in p:
             ultra_log_posterior_func = ultra_log_posterior_SHOTerm
             self.gp = True
@@ -2271,6 +2281,7 @@ class Dataset(object):
         sampler.run(
             min_num_live_points=live_points,
             dlogz=tol,
+            dKL=0.2,
             cluster_num_live_points=cluster_num_live_points,
         )
 
