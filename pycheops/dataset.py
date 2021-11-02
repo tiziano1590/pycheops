@@ -2281,14 +2281,10 @@ class Dataset(object):
         sampler.run(
             min_num_live_points=live_points,
             dlogz=tol,
-            dKL=0.2,
             cluster_num_live_points=cluster_num_live_points,
         )
 
         self.__lastfit__ = "ultranest"
-        sampler.plot_run()
-        sampler.plot_trace()
-        sampler.plot_corner()
         return sampler
 
     # ----------------------------------------------------------------
