@@ -46,6 +46,8 @@ from celerite2 import GaussianProcess
 from .funcs import rhostar, massradius, eclipse_phase
 from uncertainties import UFloat, ufloat
 from emcee import EnsembleSampler
+from ultranest import ReactiveNestedSampler
+from ultranest.stepsampler import RegionSliceSampler
 from os.path import join
 import corner
 from sys import stdout
@@ -1071,6 +1073,378 @@ class MultiVisit(object):
         self.result = self.__make_result__(vn, pos, vv, params, fits, priors)
 
         return self.result
+
+    # --------------------------------------------------------------------------
+
+    # --------------------------------------------------------------------------
+
+    def fit_transit_ultranest(
+        self,
+        live_points=500,
+        tol=0.5,
+        cluster_num_live_points=40,
+        logdir=None,
+        resume="overwrite",
+        adaptive_nsteps=False,
+        T_0=None,
+        P=None,
+        D=None,
+        W=None,
+        b=None,
+        f_c=None,
+        f_s=None,
+        h_1=None,
+        h_2=None,
+        ttv=False,
+        ttv_prior=3600,
+        extra_priors=None,
+        log_sigma_w=None,
+        log_omega0=None,
+        log_S0=None,
+        log_Q=None,
+        unroll=True,
+        nroll=3,
+        unwrap=False,
+        thin=1,
+        init_scale=1e-2,
+        progress=True,
+    ):
+        """
+        Use emcee to fit the transits in the current datasets
+
+        If T_0 and P are both fixed parameters then ttv=True can be used to
+        include the free parameters ttv_i, the offset in seconds from the
+        predicted time of mid-transit for each dataset i = 1, ..., N. The
+        prior on the values of ttv_i is a Gaussian with a width ttv_prior in
+        seconds.
+
+        """
+        # Dict of initial parameter values for creation of models
+        # Calculation of mean T_0 needs P and W so T_0 is not first in the list
+        vals = {
+            "D": D,
+            "W": W,
+            "b": b,
+            "P": P,
+            "T_0": T_0,
+            "f_c": f_c,
+            "f_s": f_s,
+            "h_1": h_1,
+            "h_2": h_2,
+        }
+        priors = {} if extra_priors is None else extra_priors
+        pmin = {
+            "P": 0,
+            "D": 0,
+            "W": 0,
+            "b": 0,
+            "f_c": -1,
+            "f_s": -1,
+            "h_1": 0,
+            "h_2": 0,
+        }
+        pmax = {"D": 0.3, "W": 0.3, "b": 2.0, "f_c": 1, "f_s": 1, "h_1": 1, "h_2": 1}
+        step = {
+            "D": 1e-4,
+            "W": 1e-4,
+            "b": 1e-2,
+            "P": 1e-6,
+            "T_0": 1e-4,
+            "f_c": 1e-4,
+            "f_s": 1e-3,
+            "h_1": 1e-3,
+            "h_2": 1e-2,
+            "ramp": 50,
+        }
+
+        vn, vv, vs, params = self.__make_params__(
+            vals, priors, pmin, pmax, step, extra_priors
+        )
+
+        if ttv and (params["T_0"].vary or params["P"].vary):
+            raise ValueError("TTV not allowed if P or T_0 are variables")
+
+        _ = self.__make_noisemodel__(
+            log_sigma_w, log_S0, log_omega0, log_Q, params, priors, vn, vv, vs, unroll
+        )
+        noisemodel, params, priors, vn, vv, vs = _
+
+        n_varys = len(vv)
+        params_tmp = params.copy()
+
+        _ = self.__make_modpars__(
+            "_transit_func",
+            vals,
+            params,
+            vn,
+            vv,
+            vs,
+            priors,
+            ttv,
+            ttv_prior,
+            unroll,
+            nroll,
+            unwrap,
+        )
+        params, rolls, lcs, models, modpars, glints, omegas, vn, vv, vs, priors = _
+
+        vary_params = params.copy()
+        for key in list(vary_params.keys()):
+            if not vary_params[key].vary:
+                del vary_params[key]
+
+        # pos = vv + vs * np.random.randn(n_varys) * init_scale
+
+        def make_trial_params(pos):
+            # Create a copy of the params object with the parameter values give in
+            # list vn replaced with trial values from array pos.
+            # Also returns the contribution to the log-likelihood of the parameter
+            # values.
+            # Return value is priors
+
+            pars = np.array([t for t in pos])
+
+            pmins = np.array([vary_params[par].min for par in list(vary_params.keys())])
+            pmaxs = np.array([vary_params[par].max for par in list(vary_params.keys())])
+
+            pmins[np.where(pmins == -np.inf)] = -1  # float("-inf")
+            pmaxs[np.where(pmaxs == np.inf)] = 1  # float("inf")
+
+            priors = pars * (pmaxs - pmins) + pmins
+
+            return np.array(priors)
+
+        def ultra_log_prior_func(pos):
+            lnprior = make_trial_params(pos=pos)
+            return lnprior
+
+        def ultra_log_posterior_func(pos):
+
+            lnlike = 0
+            lc_mods = []  # model light curves per dataset
+            lc_fits = []  # lc fit per dataset
+            modpars_rtn = []  # Model parameters for return_fit
+            for i, (roll, lc, model, modpar) in enumerate(
+                zip(rolls, lcs, models, modpars)
+            ):
+
+                for p in ("T_0", "P", "D", "W", "b", "f_c", "f_s", "h_1", "h_2", "L"):
+                    if p in vn:
+                        v = pos[vn.index(p)]
+                        if not np.isfinite(v):
+                            return -np.inf, -np.inf
+                        if (v < modpar[p].min) or (v > modpar[p].max):
+                            return -np.inf, -np.inf
+                        modpar[p].value = v
+
+                # Check that none of the derived parameters are out of range
+                for p in (
+                    "e",
+                    "q_1",
+                    "q_2",
+                    "k",
+                    "aR",
+                    "rho",
+                ):
+                    if p in modpar:
+                        v = modpar[p].value
+                        # if not np.isfinite(v):
+                        #     return -np.inf, -np.inf
+                        # if (v < modpar[p].min) or (v > modpar[p].max):
+                        #     return -np.inf, -np.inf
+
+                df = (
+                    "c",
+                    "dfdbg",
+                    "dfdcontam",
+                    "dfdsmear",
+                    "glint_scale",
+                    "ramp",
+                    "dfdx",
+                    "d2fdx2",
+                    "dfdy",
+                    "d2fdy2",
+                    "dfdt",
+                    "d2fdt2",
+                )
+                for d in df:
+                    p = f"{d}_{i+1:02d}"
+                    if p in vn:
+                        v = pos[vn.index(p)]
+                        if (v < modpar[d].min) or (v > modpar[d].max):
+                            return -np.inf, -np.inf
+                        modpar[d].value = v
+
+                p = f"ttv_{i+1:02d}"
+                if p in vn:
+                    v = pos[vn.index(p)]
+                    modpar["T_0"].value = modpar["T_0"].init_value + v / 86400
+
+                p = f"L_{i+1:02d}"
+                if p in vn:
+                    # Exclude negative eclipse depths
+                    if pos[vn.index(p)] < 0:
+                        return -np.inf, -np.inf
+                    modpar["L"].value = pos[vn.index(p)]
+
+                # Update noisemodel parameters
+                for p in ("log_sigma_w", "log_omega0", "log_S0", "log_Q"):
+                    if p in vn:
+                        v = pos[vn.index(p)]
+                        if (v < noisemodel[p].min) or (v > noisemodel[p].max):
+                            return -np.inf, -np.inf
+                        noisemodel[p].set(value=v)
+
+                mod = model.eval(modpar, t=lc["time"])
+                resid = lc["flux"] - mod
+                yvar = np.exp(2 * noisemodel["log_sigma_w"]) + lc["flux_err"] ** 2
+
+                if "log_Q" in noisemodel:
+                    sho = SHOTerm(
+                        S0=np.exp(noisemodel["log_S0"].value),
+                        Q=np.exp(noisemodel["log_Q"].value),
+                        w0=np.exp(noisemodel["log_omega0"].value),
+                    )
+                else:
+                    sho = None
+
+                if roll or sho:
+                    if roll and sho:
+                        kernel = sho + roll
+                    elif sho:
+                        kernel = sho
+                    else:
+                        kernel = roll
+                    gp = GaussianProcess(kernel, mean=0)
+                    gp.compute(lc["time"], diag=yvar, quiet=True)
+                    lnlike += gp.log_likelihood(resid)
+                    if return_fit:
+                        lc_fits.append(gp.predict(resid, return_cov=False) + mod)
+                else:
+                    lnlike += -0.5 * (
+                        np.sum(resid ** 2 / yvar + np.log(2 * np.pi * yvar))
+                    )
+                    if return_fit:
+                        lc_fits.append(mod)
+
+                if return_fit:
+                    modpars_rtn.append(modpar)
+
+            # if return_fit:
+            #     return lc_fits, modpars_rtn
+
+            # args = [modpar[p] for p in ("D", "W", "b")]
+            # lnprior = _log_prior(*args)  # Priors on D, W and b
+            # # if not np.isfinite(lnprior):
+            # #     return -np.inf, -np.inf
+            # for p in priors:
+            #     if p in vn:
+            #         z = (pos[vn.index(p)] - priors[p].n) / priors[p].s
+            #     elif p in (
+            #         "e",
+            #         "q_1",
+            #         "q_2",
+            #         "k",
+            #         "aR",
+            #         "rho",
+            #     ):
+            #         z = (modpar[p] - priors[p].n) / priors[p].s
+            #     elif p == "logrho":
+            #         z = (np.log10(modpar["rho"]) - priors[p].n) / priors[p].s
+            #     lnprior += -0.5 * (z ** 2 + np.log(2 * np.pi * priors[p].s ** 2))
+
+            return lnlike
+
+        # Setup sampler
+        vv = np.array(vv)
+        vs = np.array(vs)
+        pos = []
+        n_varys = len(vv)
+        return_fit = False
+        args = (lcs, rolls, models, modpars, noisemodel, priors, vn, return_fit)
+        pnames = list(vary_params.keys())
+        # for i in range(nwalkers):
+        #     lnpost_i = -np.inf
+        #     it = 0
+        #     while lnpost_i == -np.inf:
+        #         pos_i = vv + vs * np.random.randn(n_varys) * init_scale
+        #         lnpost_i, lnlike_i = _log_posterior(pos_i, *args)
+        #         it += 1
+        #         if it > _ITMAX_:
+        #             for (
+        #                 n,
+        #                 v,
+        #                 s,
+        #             ) in zip(vn, vv, vs):
+        #                 print(n, v, s)
+        #             raise Exception("Failed to initialize walkers")
+        #     pos.append(pos_i)
+
+        # with Pool(n_threads) as pool:
+        #     print(f"Running MCMC with {n_threads} cores")
+        #     sampler = EnsembleSampler(
+        #         nwalkers, n_varys, _log_posterior, args=args, pool=pool
+        #     )
+
+        #     if progress:
+        #         print("Running burn-in ..")
+        #         stdout.flush()
+        #     pos, _, _, _ = sampler.run_mcmc(
+        #         pos, burn, store=False, skip_initial_state_check=True, progress=progress
+        #     )
+        #     sampler.reset()
+        #     if progress:
+        #         print("Running sampler ..")
+        #         stdout.flush()
+        #     state = sampler.run_mcmc(
+        #         pos,
+        #         steps,
+        #         thin_by=thin,
+        #         skip_initial_state_check=True,
+        #         progress=progress,
+        #     )
+
+        print(f"Running Ultranest")
+        sampler = ReactiveNestedSampler(
+            pnames,
+            ultra_log_posterior_func,
+            ultra_log_prior_func,
+            log_dir=logdir,
+            resume=resume,
+            draw_multiple=True,
+            storage_backend="hdf5",
+        )
+
+        nsteps = 2 * len(pnames)
+
+        sampler.stepsampler = RegionSliceSampler(
+            nsteps=nsteps, adaptive_nsteps=adaptive_nsteps
+        )
+
+        sampler.run(
+            min_num_live_points=live_points,
+            dlogz=tol,
+            cluster_num_live_points=cluster_num_live_points,
+        )
+
+        # flatchain = sampler.get_chain(flat=True)
+        # pos = flatchain[np.argmax(sampler.get_log_prob()), :]
+
+        # return_fit = True
+        # args = (lcs, rolls, models, modpars, noisemodel, priors, vn, return_fit)
+        # fits, modpars = _log_posterior(pos, *args)
+
+        # self.__fitted_flux__ = [lc["flux"] for lc in lcs]
+        # self.noisemodel = noisemodel
+        # self.models = models
+        # self.modpars = modpars
+        # self.sampler = sampler
+        # self.__fittype__ = "transit"
+        # self.thin = thin
+        # self.flatchain = flatchain
+        # self.result = self.__make_result__(vn, pos, vv, params, fits, priors)
+
+        return sampler
 
     # --------------------------------------------------------------------------
 
