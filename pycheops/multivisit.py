@@ -1207,8 +1207,8 @@ class MultiVisit(object):
             pmins = np.array([vary_params[par].min for par in list(vary_params.keys())])
             pmaxs = np.array([vary_params[par].max for par in list(vary_params.keys())])
 
-            pmins[np.where(pmins == -np.inf)] = -1  # float("-inf")
-            pmaxs[np.where(pmaxs == np.inf)] = 1  # float("inf")
+            pmins[np.where(pmins == -np.inf)] = -10  # float("-inf")
+            pmaxs[np.where(pmaxs == np.inf)] = 10  # float("inf")
 
             priors = pars * (pmaxs - pmins) + pmins
 
