@@ -75,17 +75,13 @@ import pickle
 import warnings
 from astropy.units import UnitsWarning
 import cdspyreadme
-import os
 from textwrap import fill, indent
-from contextlib import redirect_stdout
-from pathos.pools import ThreadPool as Pool
-import dynesty as dyn
-import multiprocessing
+import os
+from contextlib import redirect_stderr
 
-try:
-    from dace.cheops import Cheops
-except ModuleNotFoundError:
-    pass
+with open(os.devnull, "w") as devnull:
+    with redirect_stderr(devnull):
+        from dace.cheops import Cheops
 
 _file_key_re = re.compile(r"CH_PR(\d{2})(\d{4})_TG(\d{4})(\d{2})_V(\d{4})")
 
@@ -376,20 +372,15 @@ class Dataset(object):
             else:
                 file_type = "lightcurves"
                 view_report = False
-            # Make backwards compatible with DACE API < 2.0.0
-            try:
-                Cheops.download(
-                    file_type,
-                    filters={"file_key": {"contains": file_key}},
-                    output_directory=str(tgzPath.parent),
-                    output_filename=str(tgzPath.name),
-                )
-            except TypeError:
-                Cheops.download(
-                    file_type,
-                    filters={"file_key": {"contains": file_key}},
-                    output_full_file_path=str(tgzPath),
-                )
+            # Bodge to avoid logging errors in jupyter notebooks
+            with open(os.devnull, "w+") as devnull:
+                with redirect_stderr(devnull):
+                    Cheops.download(
+                        file_type,
+                        filters={"file_key": {"contains": file_key}},
+                        output_directory=str(tgzPath.parent),
+                        output_filename=str(tgzPath.name),
+                    )
 
         lisPath = Path(_cache_path, file_key).with_suffix(".lis")
         # The file list can be out-of-date is force_download is used
@@ -414,7 +405,7 @@ class Dataset(object):
                 hdr = hdul[1].header
         else:
             tar = tarfile.open(self.tgzfile)
-            r = re.compile("(.*_SCI_COR_Lightcurve-{}_.*.fits)".format(aperture))
+            r = re.compile("(?!\.)(.*_SCI_COR_Lightcurve-{}_.*.fits)".format(aperture))
             datafile = list(filter(r.match, self.list))
             if len(datafile) == 0:
                 raise Exception("Dataset does not contain light curve data.")
@@ -474,7 +465,7 @@ class Dataset(object):
                 self.metadata = Table.read(metaPath)
             else:
                 tar = tarfile.open(self.tgzfile)
-                r = re.compile("(.*SCI_RAW_SubArray.*.fits)")
+                r = re.compile("(?!\.)(.*SCI_RAW_SubArray.*.fits)")
                 metafile = list(filter(r.match, self.list))
                 if len(metafile) > 1:
                     raise Exception("Multiple metadata files in datset")
@@ -508,7 +499,7 @@ class Dataset(object):
         wd = "pub/cheops/test_data/{}".format(subdir)
         ftp.cwd(wd)
         filelist = [fl[0] for fl in ftp.mlsd()]
-        _re = re.compile(r"CH_(PR\d{6}_TG\d{6}).zip")
+        _re = re.compile(r"(CH_PR\d{6}_TG\d{6}).zip")
         zipfiles = list(filter(_re.match, filelist))
         if len(zipfiles) > 1:
             raise ValueError("More than one dataset in ftp directory")
@@ -799,7 +790,7 @@ class Dataset(object):
         else:
             if verbose:
                 print("Extracting imagette data from ", self.tgzfile)
-            r = re.compile("(.*SCI_RAW_Imagette.*.fits)")
+            r = re.compile("(?!\.)(.*SCI_RAW_Imagette.*.fits)")
             datafile = list(filter(r.match, self.list))
             if len(datafile) == 0:
                 raise Exception("Dataset does not contains imagette data.")
@@ -836,10 +827,10 @@ class Dataset(object):
         else:
             if verbose:
                 print("Extracting subarray data from ", self.tgzfile)
-            r = re.compile("(.*SCI_COR_SubArray.*.fits)")
+            r = re.compile("(?!\.)(.*SCI_COR_SubArray.*.fits)")
             datafile = list(filter(r.match, self.list))
             if len(datafile) == 0:
-                r = re.compile("(.*SCI_RAW_SubArray.*.fits)")
+                r = re.compile("(?!\.)(.*SCI_RAW_SubArray.*.fits)")
                 datafile = list(filter(r.match, self.list))
             if len(datafile) == 0:
                 raise Exception("Dataset does not contains subarray data.")
@@ -907,7 +898,7 @@ class Dataset(object):
             if verbose:
                 print("Extracting light curve from ", self.tgzfile)
             tar = tarfile.open(self.tgzfile)
-            r = re.compile("(.*_SCI_COR_Lightcurve-{}_.*.fits)".format(aperture))
+            r = re.compile("(?!\.)(.*_SCI_COR_Lightcurve-{}_.*.fits)".format(aperture))
             datafile = list(filter(r.match, self.list))
             if len(datafile) == 0:
                 raise Exception("Dataset does not contain light curve data.")
@@ -1006,6 +997,7 @@ class Dataset(object):
                     np.nanmedian(flux_err), 1e6 * np.nanmedian(flux_err) / fluxmed
                 )
             )
+            print("Median background = {:0.0f} e-/pxl".format(np.median(bg)))
             print("Mean contamination = {:0.1f} ppm".format(1e6 * contam.mean()))
             print(
                 "Mean smearing correction = {:0.1f} ppm".format(
@@ -1070,7 +1062,7 @@ class Dataset(object):
         pdfPath = Path(self.tgzfile).parent / pdfFile
         if not pdfPath.is_file():
             tar = tarfile.open(self.tgzfile)
-            r = re.compile("(.*_RPT_COR_DataReduction_.*.pdf)")
+            r = re.compile("(?!\.)(.*_RPT_COR_DataReduction_.*.pdf)")
             report = list(filter(r.match, self.list))
             if len(report) == 0:
                 raise Exception("Dataset does not contain DRP report.")
@@ -1221,7 +1213,7 @@ class Dataset(object):
                             else:
                                 tar = tarfile.open(self.tgzfile)
                                 r = re.compile(
-                                    "(.*_SCI_COR_Lightcurve-{}_.*.fits)".format(
+                                    "(?!\.)(.*_SCI_COR_Lightcurve-{}_.*.fits)".format(
                                         aperture
                                     )
                                 )
@@ -2017,11 +2009,16 @@ class Dataset(object):
         log_Q=None,
         init_scale=1e-2,
         progress=True,
+        backend=None,
     ):
         """
         If you only want to store and yield 1-in-thin samples in the chain, set
         thin to an integer greater than 1. When this is set, thin*steps will be
         made and the chains returned with have "steps" values per walker.
+
+        See https://emcee.readthedocs.io/en/stable/tutorials/monitor/ for use
+        of the backend keyword.
+
         """
 
         try:
@@ -2073,6 +2070,9 @@ class Dataset(object):
                 params.add("log_Q", value=np.log(1 / np.sqrt(2)), vary=False)
             else:
                 params["log_Q"] = _kw_to_Parameter("log_Q", log_Q)
+            params.add("rho_SHO", expr="2*pi/exp(log_omega0)")
+            params.add("tau_SHO", expr="2*exp(log_Q)/exp(log_omega0)")
+            params.add("sigma_SHO", expr="sqrt(exp(log_Q+log_S0+log_omega0))")
 
         if "log_sigma" in k:
             pass
@@ -2121,61 +2121,43 @@ class Dataset(object):
         args += (return_fit,)
 
         # Initialize sampler positions ensuring all walkers produce valid
-        # function values.
-        pos = []
+        # function values (or pos=None if restarting from a backend)
         n_varys = len(vv)
+        if backend is None:
+            iteration = 0
+        else:
+            try:
+                iteration = backend.iteration
+            except OSError:
+                iteration = 0
+        if iteration > 0:
+            pos = None
+        else:
+            pos = []
+            for i in range(nwalkers):
+                params_tmp = params.copy()
+                lnpost_i = -np.inf
+                while lnpost_i == -np.inf:
+                    pos_i = vv + vs * np.random.randn(n_varys) * init_scale
+                    lnpost_i, lnlike_i = log_posterior_func(pos_i, *args)
+                pos.append(pos_i)
 
-        for i in range(nwalkers):
-            params_tmp = params.copy()
-            lnpost_i = -np.inf
-            while lnpost_i == -np.inf:
-                pos_i = vv + vs * np.random.randn(n_varys) * init_scale
-                lnpost_i, lnlike_i = log_posterior_func(pos_i, *args)
-            pos.append(pos_i)
-
-        with Pool() as pool:
-            print("Setting up the Dynamic Nested Samplig.")
-            sampler = dyn.DynamicNestedSampler(
-                self.dynesty_likelihoods,
-                self.dynesty_priors,
-                n_varys,
-                logl_kwargs={
-                    "model": model,
-                    "time": time,
-                    "flux": flux,
-                    "flux_err": flux_err,
-                    "params": params,
-                    "vn": vn,
-                    "return_fit": return_fit,
-                },
-                pool=pool,
-                queue_size=self.n_threads,
-                ptform_kwargs={"params": params, "vn": vn},
-            )
-            # TODO add optimisation parameters
-            print(f"Running Dynamic Nested sampling")
-            sampler.run_nested()
-            # sampler = EnsembleSampler(
-            #     nwalkers, n_varys, log_posterior_func, args=args, pool=pool
-            # )
-        print("Wonderful")
-        # if progress:
-        #     print("Running burn-in ..")
-        #     stdout.flush()
-        # pos, _, _, _ = sampler.run_mcmc(
-        #     pos, burn, store=False, skip_initial_state_check=True, progress=progress
-        # )
-        # sampler.reset()
-        # if progress:
-        #     print("Running sampler ..")
-        #     stdout.flush()
-        # state = sampler.run_mcmc(
-        #     pos,
-        #     steps,
-        #     thin_by=thin,
-        #     skip_initial_state_check=True,
-        #     progress=progress,
-        # )
+        sampler = EnsembleSampler(
+            nwalkers, n_varys, log_posterior_func, args=args, backend=backend
+        )
+        if progress:
+            print("Running burn-in ..")
+            stdout.flush()
+        pos, _, _, _ = sampler.run_mcmc(
+            pos, burn, store=False, skip_initial_state_check=True, progress=progress
+        )
+        sampler.reset()
+        if progress:
+            print("Running sampler ..")
+            stdout.flush()
+        state = sampler.run_mcmc(
+            pos, steps, thin_by=thin, skip_initial_state_check=True, progress=progress
+        )
 
         flatchain = sampler.get_chain(flat=True).reshape((-1, len(vn)))
         pos_i = flatchain[np.argmax(sampler.get_log_prob()), :]
@@ -2467,8 +2449,12 @@ class Dataset(object):
         The red vertical dotted lines show the CHEOPS  orbital frequency and
         its first two harmonics.
 
-        If star is a pycheops starproperties object and star.teff is <7000K,
-        then the likely range of nu_max is shown using green dashed lines.
+        If star is a pycheops starproperties object and
+        5000 K < star.teff < 7000 K, then the likely range of nu_max is shown
+        using green dashed lines.
+
+        The expected power due to white noise is shown as a horizontal dashed
+        gray line.
 
         """
         try:
@@ -2498,12 +2484,16 @@ class Dataset(object):
         p_smooth = convolve(power, Gaussian1DKernel(gsmooth))
 
         plt.rc("font", size=fontsize)
-        fig, ax = plt.subplots(figsize=(8, 5))
+        fig, ax = plt.subplots(figsize=figsize)
+        # Expected white-noise level based on median error bar
+        sigma_w = 1e6 * np.nanmedian(flux_err / flux)  # Median error in ppm
+        power_w = 1e-6 * sigma_w ** 2  # ppm^2/micro-Hz
+        ax.axhline(power_w, ls="--", c="dimgray")
         ax.loglog(frequency * 1e6, power / 1e6, c="gray", alpha=0.5)
         ax.loglog(frequency * 1e6, p_smooth / 1e6, c="darkcyan")
         # nu_max from Campante et al. (2016) eq (20)
         if star is not None:
-            if star.teff < 7000:
+            if abs(star.teff - 6000) < 1000:
                 nu_max = 3090 * 10 ** (star.logg - 4.438) * usqrt(star.teff / 5777)
                 ax.axvline(nu_max.n - nu_max.s, ls="--", c="g")
                 ax.axvline(nu_max.n + nu_max.s, ls="--", c="g")
@@ -2937,7 +2927,7 @@ class Dataset(object):
         abstract=None,
         keywords=None,
         bibcode=None,
-        acknowledgments=None,
+        acknowledgements=None,
     ):
         """
         Save light curve, best fit, etc. to files suitable for CDS upload
@@ -2954,7 +2944,7 @@ class Dataset(object):
         F9.7  ---     contam   Fraction of flux in aperture from nearby stars
         F9.7  ---     smear    Fraction of flux in aperture from readout trails
         F9.7  ---     bg       Fraction of flux in aperture from background
-        F6.3  degC    temp_2   thermFront_2 instrument temperature
+        F6.3  ---     temp_2   thermFront_2 temperature sensor reading
 
         :param lcfile: output file for upload to CDS
         :param title: title
@@ -2963,12 +2953,12 @@ class Dataset(object):
         :param abstract: Abstract of the paper
         :param keywords: list of keywords as in the printed publication
         :param bibcode: Bibliography code for the printed publication
-        :param acknowledgments: list of acknowledgments
+        :param acknowledgements: list of acknowledgements
 
         See http://cdsarc.u-strasbg.fr/submit/catstd/catstd-3.1.htx for the
         correct formatting of title, keywords, etc.
 
-        The acknowledgments are normally used to give the name and e-mail
+        The acknowledgements are normally used to give the name and e-mail
         address of the person who generated the table, e.g.
         "Pierre Maxted, p.maxted(at)keele.ac.uk"
 
@@ -3040,7 +3030,7 @@ class Dataset(object):
         if np.ptp(self.lc["deltaT"]) > 0:
             T["temp_2"] = self.lc["deltaT"] - 12
             T["temp_2"].info.format = "6.3f"
-            T["temp_2"].description = "thermFront_2 instrument temperature"
+            T["temp_2"].description = "thermFront_2 temperature sensor reading"
             T["temp_2"].units = u.Celsius
 
         table = tmk.addTable(
@@ -3054,14 +3044,11 @@ class Dataset(object):
         c = table.get_column("time")
         c.unit = "d"
         c = table.get_column("xoff")
-        c.unit = "pxl"
+        c.unit = "pix"
         c = table.get_column("yoff")
-        c.unit = "pxl"
+        c.unit = "pix"
         c = table.get_column("roll")
         c.unit = "deg"
-        if np.ptp(self.lc["deltaT"]) > 0:
-            c = table.get_column("temp_2")
-            c.unit = "degC"
         tmk.writeCDSTables()
 
         templatename = os.path.join(
@@ -3093,7 +3080,7 @@ class Dataset(object):
         templateValue = {
             "object": f"{rastr} {destr}   {self.target}",
             "description": desc,
-            "acknowledgements": f"Pierre Maxted, p.maxted(at)keele.ac.uk",
+            "acknowledgements": acknowledgements,
         }
         tmk.setReadmeTemplate(templatename, templateValue)
         with open("ReadMe", "w") as fd:
