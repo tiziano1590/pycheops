@@ -32,12 +32,17 @@ from astropy.coordinates import SkyCoord
 import requests
 from .core import load_config
 from pathlib import Path
-from os.path import getmtime
 from time import localtime, mktime
 from uncertainties import ufloat, UFloat
 from .ld import stagger_power2_interpolator, atlas_h1h2_interpolator
 from .ld import phoenix_h1h2_interpolator
 from numpy.random import normal
+import os
+from contextlib import redirect_stderr
+
+with open(os.devnull, "w") as devnull:
+    with redirect_stderr(devnull):
+        from dace.cheops import Cheops
 
 
 class StarProperties(object):
@@ -99,14 +104,14 @@ class StarProperties(object):
 
         config = load_config(configFile)
         _cache_path = config["DEFAULT"]["data_cache_path"]
-        sweetCatPath = Path(_cache_path, "sweetcat.tsv")
+        sweetCatPath = Path(_cache_path, "sweetcat.csv")
 
         if force_download:
             download_sweetcat = True
         elif dace:
             download_sweetcat = False
         elif sweetCatPath.is_file():
-            file_age = mktime(localtime()) - getmtime(sweetCatPath)
+            file_age = mktime(localtime()) - os.path.getmtime(sweetCatPath)
             if file_age > int(config["SWEET-Cat"]["update_interval"]):
                 download_sweetcat = True
             else:
@@ -141,63 +146,29 @@ class StarProperties(object):
             self.gaiadr2 = db["obj_id_gaiadr2"][idx]
 
         else:
-            names = [
-                "star",
-                "hd",
-                "ra",
-                "dec",
-                "vmag",
-                "e_vmag",
-                "par",
-                "e_par",
-                "parsource",
-                "teff",
-                "e_teff",
-                "logg",
-                "e_logg",
-                "logglc",
-                "e_logglc",
-                "vt",
-                "e_vt",
-                "metal",
-                "e_metal",
-                "mass",
-                "e_mass",
-                "author",
-                "source",
-                "update",
-                "comment",
-            ]
-            sweetCat = Table.read(
-                sweetCatPath,
-                format="ascii.no_header",
-                delimiter="\t",
-                fast_reader=False,
-                names=names,
-                encoding="utf-8",
-            )
+            sweetCat = Table.read(sweetCatPath, format="csv")
 
             if match_arcsec is None:
                 entry = None
             else:
-                cat_c = SkyCoord(sweetCat["ra"], sweetCat["dec"], unit="hour,degree")
+                cat_c = SkyCoord(sweetCat["RA"], sweetCat["DEC"], unit="hour,degree")
                 idx, sep, _ = coords.match_to_catalog_sky(cat_c)
                 if sep.arcsec[0] > match_arcsec:
                     raise ValueError("No matching star in SWEET-Cat")
                 entry = sweetCat[idx]
 
             try:
-                self.teff = ufloat(float(entry["teff"]), float(entry["e_teff"]))
+                self.teff = ufloat(entry["Teff"], entry["eTeff"])
                 self.teff_note = "SWEET-Cat"
             except:
                 self.teff = None
             try:
-                self.logg = ufloat(float(entry["logg"]), float(entry["e_logg"]))
+                self.logg = ufloat(entry["Logg"], entry["eLogg"])
                 self.logg_note = "SWEET-Cat"
             except:
                 self.logg = None
             try:
-                self.metal = ufloat(float(entry["metal"]), float(entry["e_metal"]))
+                self.metal = ufloat(entry["[Fe/H]"], entry["e[Fe/H]"])
                 self.metal_note = "SWEET-Cat"
             except:
                 self.metal = None

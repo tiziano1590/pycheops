@@ -27,6 +27,7 @@ Dataset
 from __future__ import absolute_import, division, print_function, unicode_literals
 from IPython.core.display import display
 import numpy as np
+import os
 import tarfile
 from zipfile import ZipFile
 import re
@@ -80,17 +81,15 @@ import pickle
 import warnings
 from astropy.units import UnitsWarning
 import cdspyreadme
-import os
 from textwrap import fill, indent
 from contextlib import redirect_stdout
 from pathos.pools import ThreadPool as Pool
 from .constants import MAX_EXPOSURE_SEC
 from mpi4py import MPI
 
-try:
-    from dace.cheops import Cheops
-except ModuleNotFoundError:
-    pass
+with open(os.devnull, "w") as devnull:
+    with redirect_stderr(devnull):
+        from dace.cheops import Cheops
 
 LN2PI = np.log(2.0 * np.pi)
 LNSIGMA = np.log(10)
@@ -2320,6 +2319,10 @@ class Dataset(object):
         If you only want to store and yield 1-in-thin samples in the chain, set
         thin to an integer greater than 1. When this is set, thin*steps will be
         made and the chains returned with have "steps" values per walker.
+
+        See https://emcee.readthedocs.io/en/stable/tutorials/monitor/ for use
+        of the backend keyword.
+
         """
 
         try:
@@ -2422,8 +2425,7 @@ class Dataset(object):
         args += (return_fit,)
 
         # Initialize sampler positions ensuring all walkers produce valid
-        # function values.
-        pos = []
+        # function values (or pos=None if restarting from a backend)
         n_varys = len(vv)
         if backend is None:
             iteration = 0
@@ -3246,7 +3248,7 @@ class Dataset(object):
         F9.7  ---     contam   Fraction of flux in aperture from nearby stars
         F9.7  ---     smear    Fraction of flux in aperture from readout trails
         F9.7  ---     bg       Fraction of flux in aperture from background
-        F6.3  degC    temp_2   thermFront_2 instrument temperature
+        F6.3  ---     temp_2   thermFront_2 temperature sensor reading
 
         :param lcfile: output file for upload to CDS
         :param title: title
@@ -3255,7 +3257,7 @@ class Dataset(object):
         :param abstract: Abstract of the paper
         :param keywords: list of keywords as in the printed publication
         :param bibcode: Bibliography code for the printed publication
-        :param acknowledgments: list of acknowledgments
+        :param acknowledgements: list of acknowledgements
 
         See http://cdsarc.u-strasbg.fr/submit/catstd/catstd-3.1.htx for the
         correct formatting of title, keywords, etc.

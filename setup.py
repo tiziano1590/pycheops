@@ -89,7 +89,12 @@ setup(
             'matplotlib>3.2',
             'celerite2',
             'cdspyreadme',
+            'python-dace-client > 2.0.0',
             'tqdm'],
+
+    dependency_links=[
+        'https://dace.unige.ch/api/python-dace-client/'
+    ],
 
     # List additional groups of dependencies here (e.g. development
     # dependencies). You can install these using the following syntax,
@@ -118,6 +123,7 @@ setup(
     # pip to create the appropriate form of executable for the target platform.
     entry_points={
         'console_scripts': [
+            'calculate_coefficients=pycheops.calculate_coefficients:main',
             'make_xml_files=pycheops.make_xml_files:main',
             'combine=pycheops.combine:main',
         ],

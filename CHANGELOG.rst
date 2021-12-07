@@ -1,6 +1,72 @@
 Changes since 0.6.0 onwards.
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+1.0.1 (2021-11-21)
+~~~~~~~~~~~~~~~~~~~
+* Attempted fix in 0.9.18 to avoid hidden files in dataset() failed - fixed.
+
+1.0.0 (2021-11-17)
+~~~~~~~~~~~~~~~~~~~
+* Updated readme, notebooks and cookbook for release of version 1.0.0
+ 
+0.9.18 (2021-11-16)
+~~~~~~~~~~~~~~~~~~~
+* Include "CH" at the start of pattern matches for file names in dataset.py to
+  avoid finding hidden files. 
+
+0.9.17 (2021-11-13)
+~~~~~~~~~~~~~~~~~~~
+* Update StarProperties and core for new location and format of SWEET-Cat
+* Added backend option to MultiVisit and Dataset fit routines (#169)
+* Added rho, sigma and tau to SHOTerm output (#206)
+
+0.9.16 (2021-10-27)
+~~~~~~~~~~~~~~~~~~~
+* Remove html versions of example notebooks
+* Added parameter hint for ramp in models.FactorModel
+* Use np.nanmean() and np.nanmedian() in utils.lcbin
+* Bug fix for unwrap=True in multivisit - dfdsin2pi, dfdcos2phi, dfdsin3phi
+  and dfdcos3phi terms were not be removed.
+
+0.9.15 (2021-10-20)
+~~~~~~~~~~~~~~~~~~~
+* Fixed plotting bug for models not in phase order in MultiVisit.plot_fit()
+* Dataset.cds_data_export: acknowledgments -> acknowledgements
+
+0.9.14 (2021-10-19)
+~~~~~~~~~~~~~~~~~~~
+* Added dependency_links for python-dace-client to setup.py
+* Updated INSTALLATION 
+* Replaced try/except/pass guards around dace imports in all files with
+  redirect_syserr(devnull). 
+* Updated examples/Notebooks
+
+0.9.13 (2021-10-17)
+~~~~~~~~~~~~~~~~~~~
+* Major re-factoring of multivisit needed to fix/clarify what is meant by
+  detrended flux for plotting and table output routines. 
+* Added calculate_coefficients.py script
+* Added white-noise baseline to dataset.plot_fft()
+* Exclude nu_max plot for stars Teff<5000K in dataset.plot_fft
+* Added median background count rate to summary on ingest in Dataset
+* Renamed flatchain attribute in MinimizerResult object returned by fitting
+  routines to flat_chain to avoid conflict with documented behaviour
+* Added cds_data_export() function to MultiVisit
+* Guard against failed dace import in planetproperties (#232)
+* Fix bug in combine that was excluding valid range of sigma_ext values, not
+  including it. 
+
+0.9.12 (2021-08-04)
+~~~~~~~~~~~~~~~~~~~
+* Avoid warnings due to truncated strings for RA/Dec in make_xml_files
+* Changed default suffix in make_xml_files to that required for CHEOPSim
+* Added --checker and --directory options to make_xml_files
+* Convert K_val and K_err to m/s in planetproperties (#228)
+* Fixed planetproperties bug for 'NaN' values in dace obj_rv_k_mps data
+* Fix problem with ambiguous planet identifiers in TEPCat for planetproperties
+* Changed keywoards D->depth and W->width for planetproperties to avoid
+  confusion with D and W in transit model
+  
 0.9.11 (2021-04-24)
 ~~~~~~~~~~~~~~~~~~~
 * Added data.cds_data_export()
@@ -14,7 +80,8 @@ Changes since 0.6.0 onwards.
 * Correct typo in combine.py
 * Added dfdsmear to _make_labels in dataset (#224)
 * dataset.lc['bg'] is now normalized by the median flux in the aperture
-
+* Added explanation of what is meant by detrended flux to multivisit docstring
+  
 0.9.10 (2021-03-23)
 ~~~~~~~~~~~~~~~~~~~
 * Update dataset.py for compatibility with DACE API 2.0.0

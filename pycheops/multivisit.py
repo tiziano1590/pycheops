@@ -55,15 +55,22 @@ from os.path import join
 import corner
 from sys import stdout
 import matplotlib.pyplot as plt
+from collections import OrderedDict
 from lmfit.printfuncs import gformat
 from copy import copy, deepcopy
 from .utils import phaser, lcbin
 from scipy.stats import iqr
+from astropy.time import Time
+from astropy.table import Table
+from astropy import units as u
+from astropy.coordinates import SkyCoord
+import cdspyreadme
+import os
 
-from pathos.pools import ThreadPool as Pool
 
-# Iteration limit for initialosation of walkers
+# Iteration limit for initialisation of walkers
 _ITMAX_ = 999
+
 # --------
 
 
@@ -188,148 +195,6 @@ def _make_labels(plotkeys, d0):
     return labels
 
 
-# --------
-
-
-def _log_posterior(
-    pos, lcs, rolls, models, modpars, noisemodel, priors, vn, return_fit
-):
-
-    lnlike = 0
-    lc_mods = []  # model light curves per dataset
-    lc_fits = []  # lc fit per dataset
-    modpars_rtn = []  # Model parameters for return_fit
-    for i, (roll, lc, model, modpar) in enumerate(zip(rolls, lcs, models, modpars)):
-
-        for p in ("T_0", "P", "D", "W", "b", "f_c", "f_s", "h_1", "h_2", "L"):
-            if p in vn:
-                v = pos[vn.index(p)]
-                if not np.isfinite(v):
-                    return -np.inf, -np.inf
-                if (v < modpar[p].min) or (v > modpar[p].max):
-                    return -np.inf, -np.inf
-                modpar[p].value = v
-
-        # Check that none of the derived parameters are out of range
-        for p in (
-            "e",
-            "q_1",
-            "q_2",
-            "k",
-            "aR",
-            "rho",
-        ):
-            if p in modpar:
-                v = modpar[p].value
-                if not np.isfinite(v):
-                    return -np.inf, -np.inf
-                if (v < modpar[p].min) or (v > modpar[p].max):
-                    return -np.inf, -np.inf
-
-        df = (
-            "c",
-            "dfdbg",
-            "dfdcontam",
-            "dfdsmear",
-            "glint_scale",
-            "ramp",
-            "dfdx",
-            "d2fdx2",
-            "dfdy",
-            "d2fdy2",
-            "dfdt",
-            "d2fdt2",
-        )
-        for d in df:
-            p = f"{d}_{i+1:02d}"
-            if p in vn:
-                v = pos[vn.index(p)]
-                if (v < modpar[d].min) or (v > modpar[d].max):
-                    return -np.inf, -np.inf
-                modpar[d].value = v
-
-        p = f"ttv_{i+1:02d}"
-        if p in vn:
-            v = pos[vn.index(p)]
-            modpar["T_0"].value = modpar["T_0"].init_value + v / 86400
-
-        p = f"L_{i+1:02d}"
-        if p in vn:
-            # Exclude negative eclipse depths
-            if pos[vn.index(p)] < 0:
-                return -np.inf, -np.inf
-            modpar["L"].value = pos[vn.index(p)]
-
-        # Update noisemodel parameters
-        for p in ("log_sigma_w", "log_omega0", "log_S0", "log_Q"):
-            if p in vn:
-                v = pos[vn.index(p)]
-                if (v < noisemodel[p].min) or (v > noisemodel[p].max):
-                    return -np.inf, -np.inf
-                noisemodel[p].set(value=v)
-
-        mod = model.eval(modpar, t=lc["time"])
-        resid = lc["flux"] - mod
-        yvar = np.exp(2 * noisemodel["log_sigma_w"]) + lc["flux_err"] ** 2
-
-        if "log_Q" in noisemodel:
-            sho = SHOTerm(
-                S0=np.exp(noisemodel["log_S0"].value),
-                Q=np.exp(noisemodel["log_Q"].value),
-                w0=np.exp(noisemodel["log_omega0"].value),
-            )
-        else:
-            sho = None
-
-        if roll or sho:
-            if roll and sho:
-                kernel = sho + roll
-            elif sho:
-                kernel = sho
-            else:
-                kernel = roll
-            gp = GaussianProcess(kernel, mean=0)
-            gp.compute(lc["time"], diag=yvar, quiet=True)
-            lnlike += gp.log_likelihood(resid)
-            if return_fit:
-                lc_fits.append(gp.predict(resid, return_cov=False) + mod)
-        else:
-            lnlike += -0.5 * (np.sum(resid ** 2 / yvar + np.log(2 * np.pi * yvar)))
-            if return_fit:
-                lc_fits.append(mod)
-
-        if return_fit:
-            modpars_rtn.append(modpar)
-
-    if return_fit:
-        return lc_fits, modpars_rtn
-
-    args = [modpar[p] for p in ("D", "W", "b")]
-    lnprior = _log_prior(*args)  # Priors on D, W and b
-    if not np.isfinite(lnprior):
-        return -np.inf, -np.inf
-    for p in priors:
-        if p in vn:
-            z = (pos[vn.index(p)] - priors[p].n) / priors[p].s
-        elif p in (
-            "e",
-            "q_1",
-            "q_2",
-            "k",
-            "aR",
-            "rho",
-        ):
-            z = (modpar[p] - priors[p].n) / priors[p].s
-        elif p == "logrho":
-            z = (np.log10(modpar["rho"]) - priors[p].n) / priors[p].s
-        lnprior += -0.5 * (z ** 2 + np.log(2 * np.pi * priors[p].s ** 2))
-
-    return lnlike + lnprior, lnlike
-
-
-# --------
-
-
 class MultiVisit(object):
     """
     CHEOPS MultiVisit object
@@ -441,7 +306,7 @@ class MultiVisit(object):
     treated as nuisance parameters that are automatically marginalised
     away by adding a suitable term (CosineTerm) to the covariance matrix. This
     is all done transparently by setting "unroll=True". The number of harmonic
-    terms is set by nroll, e.g., setting nroll=3 (recommended) includes terms
+    terms is set by nroll, e.g., setting nroll=3 (default) includes terms
     up to sin(3.phi) and cos(3.phi). This requires that phi is a linear
     function of time for each dataset, which is a good approximation for
     individual CHEOPS visits.
@@ -455,7 +320,7 @@ class MultiVisit(object):
 
     Glint correction is done independently for each dataset if the glint
     correction was included in the last fit to that dataset. The glint
-    scale factor for dataset i is labelled glint_scale_i. The glint
+    scale factor for dataset ii is labelled glint_scale_ii. The glint
     scaling factor for each dataset can either be a fixed or a free
     parameter, depending on whether it was a fixed or a free parameter in
     the last fit to that dataset.
@@ -464,11 +329,12 @@ class MultiVisit(object):
     of roll angle, Omega = d(phi)/dt, is constant. This is a reasonable
     approximation but can introduce some extra noise in cases where
     instrumental noise correlated with roll angle is large, e.g., observations
-    of faint stars in croweded fields. In this case it may be better to
-    divide-out the decorrelation against roll angle from the last fit in each
-    dataset before using "unroll", i.e., to use "unroll" as a small correction
-    to the roll-angle decorrelation. This case be done using the keyword
-    argument unwrap=True.
+    of faint stars in crowded fields. In this case it may be better to
+    include the best-fit trends against roll angle from the last fit stored in
+    the .dataset file in the fit to each dataset. This case be done using the
+    keyword argument "unwrap=True". This option can be combined with the
+    "unroll=True" option, i.e. to use "unroll"  as a small correction to the
+    "unwrap" roll-angle decorrelation from the last fit to each data set.
 
      If you only want to store and yield 1-in-thin samples in the chain, set
     thin to an integer greater than 1. When this is set, thin*steps will be
@@ -753,7 +619,7 @@ class MultiVisit(object):
                     if np.isfinite(params[k].stderr):
                         vs.append(params[k].stderr)
                     else:
-                        vs.append(0.01 * (params[k].max - params[k].min))
+                        vs.append(step[k])
             else:
                 # Needed to avoid errors when printing parameters
                 params[k].stderr = None
@@ -794,6 +660,31 @@ class MultiVisit(object):
         kwargs=None,
     ):
 
+        if fittype == "transit":
+            ttv = kwargs["ttv"]
+            ttv_prior = kwargs["ttv_prior"]
+            if ttv and (params["T_0"].vary or params["P"].vary):
+                raise ValueError("TTV not allowed if P or T_0 are variables")
+            edv, edv_prior = False, None
+
+        if fittype == "eclipse":
+            edv = kwargs["edv"]
+            edv_prior = kwargs["edv_prior"]
+            if edv and params["L"].vary:
+                raise ValueError("L must be a fixed parameter of edv=True.")
+            ttv, ttv_prior = False, None
+
+        if fittype == "eblm":
+            ttv = kwargs["ttv"]
+            ttv_prior = kwargs["ttv_prior"]
+            if ttv and (params["T_0"].vary or params["P"].vary):
+                raise ValueError("TTV not allowed if P or T_0 are variables")
+            edv = kwargs["edv"]
+            edv_prior = kwargs["edv_prior"]
+            if edv and params["L"].vary:
+                raise ValueError("L must be a fixed parameter of edv=True.")
+
+        # Make an lmfit Parameters() object that defines the noise model
         noisemodel = Parameters()
         k = "log_sigma_w"
         if fittype == "transit":
@@ -900,7 +791,6 @@ class MultiVisit(object):
         # Lists of model parameters and data for individual datasets
         fluxes_unwrap = []
         rolls = []
-        lcs = []
         models = []
         modpars = []
 
@@ -1012,7 +902,6 @@ class MultiVisit(object):
                     elif dfdp == "ramp":
                         vs.append(50)
                     else:
-                        vv.append(0)
                         vs.append(1e-6)
 
             if kwargs["unroll"]:
@@ -1107,19 +996,19 @@ class MultiVisit(object):
         self.__fluxes_sho__ = f_sho
         self.__fluxes_phi__ = f_phi
 
-    # --------------------------------------------------------------------------
+        # --------------------------------------------------------------------------
 
-    def __make_result__(self, vn, pos, vv, params, fits, priors):
         # lmfit MinimizerResult object summary of results for printing and
         # plotting. Data/objects required to re-run the analysis go directly
         # into self.
+
         result = MinimizerResult()
         result.status = 0
         result.var_names = vn
-        result.covar = np.cov(self.flatchain.T)
+        result.covar = np.cov(flatchain.T)
         result.init_vals = vv
-        result.init_values = params.valuesdict()
-        af = self.sampler.acceptance_fraction.mean()
+        result.init_values = copy(params.valuesdict())
+        af = sampler.acceptance_fraction.mean()
         result.acceptance_fraction = af
         steps, nwalkers, ndim = sampler.get_chain().shape
         result.thin = kwargs["thin"]
@@ -1148,16 +1037,15 @@ class MultiVisit(object):
         quantiles = np.percentile(flatchain, [15.87, 50, 84.13], axis=0)
         corrcoefs = np.corrcoef(flatchain.T)
         parbest = params.copy()
-        corrcoefs = np.corrcoef(self.flatchain.T)
         for i, n in enumerate(vn):
             std_l, median, std_u = quantiles[:, i]
             params[n].value = median
             params[n].stderr = 0.5 * (std_u - std_l)
             parbest[n].value = pos[i]
             parbest[n].stderr = 0.5 * (std_u - std_l)
-            if n in self.noisemodel:
-                self.noisemodel[n].value = median
-                self.noisemodel[n].stderr = 0.5 * (std_u - std_l)
+            if n in self.__noisemodel__:
+                self.__noisemodel__[n].value = median
+                self.__noisemodel__[n].stderr = 0.5 * (std_u - std_l)
             correl = {}
             for j, n2 in enumerate(vn):
                 if i != j:
@@ -1166,7 +1054,192 @@ class MultiVisit(object):
             parbest[n].correl = correl
         result.params = params
         result.parbest = parbest
+        result.flat_chain = flatchain
+        self.__parbest__ = parbest
+        self.__result__ = result
+        self.__sampler__ = sampler
+
         return result
+
+    # --------------------------------------------------------------------------
+
+    def _lnpost_(self, pos, return_fit=False):
+
+        lnlike = 0
+        if return_fit:
+            fluxes_sys = []  # transits and eclipses only
+            fluxes_fit = []  # lc fit per dataset
+            fluxes_sho = []  # GP process from SHOTerm() kernel only
+            fluxes_det = []  # detrended fluxes
+            fluxes_phi = []  # Roll-angle trends if unroll=True
+
+        # Update self.__noisemodel__ parameters
+        vn = self.__var_names__
+        noisemodel = self.__noisemodel__
+        for p in ("log_sigma_w", "log_omega0", "log_S0", "log_Q"):
+            if p in vn:
+                v = pos[vn.index(p)]
+                if (v < noisemodel[p].min) or (v > noisemodel[p].max):
+                    return -np.inf, -np.inf
+                noisemodel[p].set(value=v)
+        if "log_Q" in noisemodel:
+            sho = SHOTerm(
+                S0=np.exp(noisemodel["log_S0"].value),
+                Q=np.exp(noisemodel["log_Q"].value),
+                w0=np.exp(noisemodel["log_omega0"].value),
+            )
+        else:
+            sho = False
+
+        for i, dataset in enumerate(self.datasets):
+            lc = dataset.lc
+            model = self.__models__[i]
+            modpar = self.__modpars__[i]
+            roll = self.__rolls__[i]
+            f_unwrap = self.__fluxes_unwrap__[i]
+
+            for p in ("T_0", "P", "D", "W", "b", "f_c", "f_s", "h_1", "h_2", "L"):
+                if p in vn:
+                    v = pos[vn.index(p)]
+                    if not np.isfinite(v):
+                        return -np.inf, -np.inf
+                    if (v < modpar[p].min) or (v > modpar[p].max):
+                        return -np.inf, -np.inf
+                    modpar[p].value = v
+
+            # Check that none of the derived parameters are out of range
+            for p in (
+                "e",
+                "q_1",
+                "q_2",
+                "k",
+                "aR",
+                "rho",
+            ):
+                if p in modpar:
+                    v = modpar[p].value
+                    if not np.isfinite(v):
+                        return -np.inf, -np.inf
+                    if (v < modpar[p].min) or (v > modpar[p].max):
+                        return -np.inf, -np.inf
+
+            df = (
+                "c",
+                "dfdbg",
+                "dfdcontam",
+                "dfdsmear",
+                "glint_scale",
+                "ramp",
+                "dfdx",
+                "d2fdx2",
+                "dfdy",
+                "d2fdy2",
+                "dfdt",
+                "d2fdt2",
+            )
+            for d in df:
+                p = f"{d}_{i+1:02d}"
+                if p in vn:
+                    v = pos[vn.index(p)]
+                    if (v < modpar[d].min) or (v > modpar[d].max):
+                        return -np.inf, -np.inf
+                    modpar[d].value = v
+
+            p = f"ttv_{i+1:02d}"
+            if p in vn:
+                v = pos[vn.index(p)]
+                modpar["T_0"].value = modpar["T_0"].init_value + v / 86400
+
+            p = f"L_{i+1:02d}"
+            if p in vn:
+                # Exclude negative eclipse depths
+                if pos[vn.index(p)] < 0:
+                    return -np.inf, -np.inf
+                modpar["L"].value = pos[vn.index(p)]
+
+            # Evalate components of the model so that we can extract them
+            f_model = model.eval(modpar, t=lc["time"])
+            resid = lc["flux"] - f_unwrap - f_model
+            yvar = np.exp(2 * noisemodel["log_sigma_w"]) + lc["flux_err"] ** 2
+
+            if roll or sho:
+                if roll and sho:
+                    kernel = sho + roll
+                elif sho:
+                    kernel = sho
+                else:
+                    kernel = roll
+                gp = GaussianProcess(kernel)
+                gp.compute(lc["time"], diag=yvar, quiet=True)
+                if return_fit:
+                    k = f"_{self.__fittype__}_func"
+                    f_sys = model.eval_components(params=modpar, t=lc["time"])[k]
+                    fluxes_sys.append(f_sys)
+                    f_celerite = gp.predict(resid, include_mean=False)
+                    f_fit = f_model + f_celerite + f_unwrap
+                    fluxes_fit.append(f_fit)
+                    if roll and sho:
+                        f_sho = gp.predict(
+                            resid, include_mean=False, kernel=gp.kernel.terms[0]
+                        )
+                        f_phi = gp.predict(
+                            resid, include_mean=False, kernel=gp.kernel.terms[1]
+                        )
+                    elif sho:
+                        f_sho = f_celerite
+                        f_phi = np.zeros_like(resid)
+                    else:
+                        f_sho = np.zeros_like(resid)
+                        f_phi = f_celerite
+
+                    f_det = f_sys + f_sho + f_fit - lc["flux"]
+                    fluxes_det.append(f_det)
+                    fluxes_sho.append(f_sho)
+                    fluxes_phi.append(f_phi)
+                else:
+                    lnlike += gp.log_likelihood(resid)
+            else:
+                if return_fit:
+                    k = f"_{self.__fittype__}_func"
+                    f_sys = model.eval_components(params=modpar, t=lc["time"])[k]
+                    fluxes_sys.append(f_sys)
+                    f_fit = f_model + f_unwrap
+                    fluxes_fit.append(f_fit)
+                    f_det = f_sys + f_fit - lc["flux"]
+                    fluxes_det.append(f_det)
+                    fluxes_sho.append(np.zeros_like(f_sys))
+                    lc_fits.append(mod)
+                else:
+                    lnlike += -0.5 * (
+                        np.sum(resid ** 2 / yvar + np.log(2 * np.pi * yvar))
+                    )
+
+        if return_fit:
+            return fluxes_fit, fluxes_sys, fluxes_det, fluxes_sho, fluxes_phi
+
+        args = [modpar[p] for p in ("D", "W", "b")]
+        lnprior = _log_prior(*args)  # Priors on D, W and b
+        if not np.isfinite(lnprior):
+            return -np.inf, -np.inf
+        for p in self.__priors__:
+            pn = self.__priors__[p].n
+            ps = self.__priors__[p].s
+            if p in vn:
+                z = (pos[vn.index(p)] - pn) / ps
+            elif p in (
+                "e",
+                "q_1",
+                "q_2",
+                "k",
+                "aR",
+                "rho",
+            ):
+                z = (modpar[p] - pn) / ps
+            elif p == "logrho":
+                z = (np.log10(modpar["rho"]) - pn) / ps
+            lnprior += -0.5 * (z ** 2 + np.log(2 * np.pi * ps ** 2))
+
+        return lnlike + lnprior, lnlike
 
     # --------------------------------------------------------------------------
 
@@ -1175,7 +1248,6 @@ class MultiVisit(object):
         steps=128,
         nwalkers=64,
         burn=256,
-        n_threads=1,
         T_0=None,
         P=None,
         D=None,
@@ -1198,6 +1270,7 @@ class MultiVisit(object):
         thin=1,
         init_scale=1e-2,
         progress=True,
+        backend=None,
     ):
         """
         Use emcee to fit the transits in the current datasets
@@ -1209,138 +1282,12 @@ class MultiVisit(object):
         seconds.
 
         """
-        # Dict of initial parameter values for creation of models
-        # Calculation of mean T_0 needs P and W so T_0 is not first in the list
-        vals = {
-            "D": D,
-            "W": W,
-            "b": b,
-            "P": P,
-            "T_0": T_0,
-            "f_c": f_c,
-            "f_s": f_s,
-            "h_1": h_1,
-            "h_2": h_2,
-        }
-        priors = {} if extra_priors is None else extra_priors
-        pmin = {
-            "P": 0,
-            "D": 0,
-            "W": 0,
-            "b": 0,
-            "f_c": -1,
-            "f_s": -1,
-            "h_1": 0,
-            "h_2": 0,
-        }
-        pmax = {"D": 0.3, "W": 0.3, "b": 2.0, "f_c": 1, "f_s": 1, "h_1": 1, "h_2": 1}
-        step = {
-            "D": 1e-4,
-            "W": 1e-4,
-            "b": 1e-2,
-            "P": 1e-6,
-            "T_0": 1e-4,
-            "f_c": 1e-4,
-            "f_s": 1e-3,
-            "h_1": 1e-3,
-            "h_2": 1e-2,
-            "ramp": 50,
-        }
-
-        vn, vv, vs, params = self.__make_params__(
-            vals, priors, pmin, pmax, step, extra_priors
-        )
-
-        if ttv and (params["T_0"].vary or params["P"].vary):
-            raise ValueError("TTV not allowed if P or T_0 are variables")
-
-        _ = self.__make_noisemodel__(
-            log_sigma_w, log_S0, log_omega0, log_Q, params, priors, vn, vv, vs, unroll
-        )
-        noisemodel, params, priors, vn, vv, vs = _
-
-        _ = self.__make_modpars__(
-            "_transit_func",
-            vals,
-            params,
-            vn,
-            vv,
-            vs,
-            priors,
-            ttv,
-            ttv_prior,
-            unroll,
-            nroll,
-            unwrap,
-        )
-        params, rolls, lcs, models, modpars, glints, omegas, vn, vv, vs, priors = _
-
-        # Setup sampler
-        vv = np.array(vv)
-        vs = np.array(vs)
-        pos = []
-        n_varys = len(vv)
-        return_fit = False
-        args = (lcs, rolls, models, modpars, noisemodel, priors, vn, return_fit)
-        for i in range(nwalkers):
-            lnpost_i = -np.inf
-            it = 0
-            while lnpost_i == -np.inf:
-                pos_i = vv + vs * np.random.randn(n_varys) * init_scale
-                lnpost_i, lnlike_i = _log_posterior(pos_i, *args)
-                it += 1
-                if it > _ITMAX_:
-                    for (
-                        n,
-                        v,
-                        s,
-                    ) in zip(vn, vv, vs):
-                        print(n, v, s)
-                    raise Exception("Failed to initialize walkers")
-            pos.append(pos_i)
-
-        with Pool(n_threads) as pool:
-            print(f"Running MCMC with {n_threads} cores")
-            sampler = EnsembleSampler(
-                nwalkers, n_varys, _log_posterior, args=args, pool=pool
-            )
-
-            if progress:
-                print("Running burn-in ..")
-                stdout.flush()
-            pos, _, _, _ = sampler.run_mcmc(
-                pos, burn, store=False, skip_initial_state_check=True, progress=progress
-            )
-            sampler.reset()
-            if progress:
-                print("Running sampler ..")
-                stdout.flush()
-            state = sampler.run_mcmc(
-                pos,
-                steps,
-                thin_by=thin,
-                skip_initial_state_check=True,
-                progress=progress,
-            )
-
-        flatchain = sampler.get_chain(flat=True)
-        pos = flatchain[np.argmax(sampler.get_log_prob()), :]
-
-        return_fit = True
-        args = (lcs, rolls, models, modpars, noisemodel, priors, vn, return_fit)
-        fits, modpars = _log_posterior(pos, *args)
-
-        self.__fitted_flux__ = [lc["flux"] for lc in lcs]
-        self.noisemodel = noisemodel
-        self.models = models
-        self.modpars = modpars
-        self.sampler = sampler
+        # Get a dictionary of all keyword arguments excluding 'self'
+        kwargs = dict(locals())
+        del kwargs["self"]
         self.__fittype__ = "transit"
-        self.thin = thin
-        self.flatchain = flatchain
-        self.result = self.__make_result__(vn, pos, vv, params, fits, priors)
 
-        return self.result
+        return self.__run_emcee__(**kwargs)
 
     # --------------------------------------------------------------------------
 
@@ -1980,109 +1927,10 @@ class MultiVisit(object):
         L_i is a Gaussian with mean value L and width edv_prior.
 
         """
-
-        # Dict of initial parameter values for creation of models
-        # Calculation of mean T_0 needs P and W so T_0 is not first in the list
-        vals = {
-            "D": D,
-            "W": W,
-            "b": b,
-            "P": P,
-            "T_0": T_0,
-            "f_c": f_c,
-            "f_s": f_s,
-            "L": L,
-            "a_c": a_c,
-        }
-        priors = {} if extra_priors is None else extra_priors
-        pmin = {"P": 0, "D": 0, "W": 0, "b": 0, "f_c": -1, "f_s": -1, "L": 0}
-        pmax = {"D": 0.3, "W": 0.3, "b": 2.0, "f_c": 1, "f_s": 1, "L": 1.0}
-        step = {"D": 1e-4, "W": 1e-4, "b": 1e-2, "P": 1e-6, "T_0": 1e-4, "L": 1e-5}
-
-        vn, vv, vs, params = self.__make_params__(
-            vals, priors, pmin, pmax, step, extra_priors
-        )
-
-        if edv and params["L"].vary:
-            raise ValueError("L must be a fixed parameter of edv=True.")
-
-        _ = self.__make_noisemodel__(
-            log_sigma_w, log_S0, log_omega0, log_Q, params, priors, vn, vv, vs, unroll
-        )
-        noisemodel, params, priors, vn, vv, vs = _
-
-        _ = self.__make_modpars__(
-            "_eclipse_func",
-            vals,
-            params,
-            vn,
-            vv,
-            vs,
-            priors,
-            edv,
-            edv_prior,
-            unroll,
-            nroll,
-            unwrap,
-        )
-        params, rolls, lcs, models, modpars, glints, omegas, vn, vv, vs, priors = _
-
-        # Setup sampler
-        vv = np.array(vv)
-        vs = np.array(vs)
-        pos = []
-        n_varys = len(vv)
-        return_fit = False
-        args = (lcs, rolls, models, modpars, noisemodel, priors, vn, return_fit)
-        for i in range(nwalkers):
-            lnpost_i = -np.inf
-            it = 0
-            while lnpost_i == -np.inf:
-                pos_i = vv + vs * np.random.randn(n_varys) * init_scale
-                lnpost_i, lnlike_i = _log_posterior(pos_i, *args)
-                it += 1
-                if it > _ITMAX_:
-                    for (
-                        n,
-                        v,
-                        s,
-                    ) in zip(vn, vv, vs):
-                        print(n, v, s)
-                    raise Exception("Failed to initialize walkers")
-            pos.append(pos_i)
-
-        sampler = EnsembleSampler(nwalkers, n_varys, _log_posterior, args=args)
-
-        if progress:
-            print("Running burn-in ..")
-            stdout.flush()
-        pos, _, _, _ = sampler.run_mcmc(
-            pos, burn, store=False, skip_initial_state_check=True, progress=progress
-        )
-        sampler.reset()
-        if progress:
-            print("Running sampler ..")
-            stdout.flush()
-        state = sampler.run_mcmc(
-            pos, steps, thin_by=thin, skip_initial_state_check=True, progress=progress
-        )
-
-        flatchain = sampler.get_chain(flat=True)
-        pos = flatchain[np.argmax(sampler.get_log_prob()), :]
-
-        return_fit = True
-        args = (lcs, rolls, models, modpars, noisemodel, priors, vn, return_fit)
-        fits, modpars = _log_posterior(pos, *args)
-
-        self.__fitted_flux__ = [lc["flux"] for lc in lcs]
-        self.noisemodel = noisemodel
-        self.models = models
-        self.modpars = modpars
-        self.sampler = sampler
+        # Get a dictionary of all keyword arguments excluding 'self'
+        kwargs = dict(locals())
+        del kwargs["self"]
         self.__fittype__ = "eclipse"
-        self.thin = thin
-        self.flatchain = flatchain
-        self.result = self.__make_result__(vn, pos, vv, params, fits, priors)
 
         # return self.result
         # Get a dictionary of all keyword arguments excluding 'self'
@@ -2282,11 +2130,8 @@ class MultiVisit(object):
         self.modpars = modpars
         self.sampler = sampler
         self.__fittype__ = "eblm"
-        self.thin = thin
-        self.flatchain = flatchain
-        self.result = self.__make_result__(vn, pos, vv, params, fits, priors)
 
-        return self.result
+        return self.__run_emcee__(**kwargs)
 
     # --------------------------------------------------------------------------
 
@@ -2301,7 +2146,7 @@ class MultiVisit(object):
         j = report.index("[[Variables]]")
         report = report[:j] + s + report[j:]
         noPriors = True
-        params = self.result.params
+        params = result.params
         parnames = list(params.keys())
         namelen = max([len(n) for n in parnames])
         if result.npriors > 0:
@@ -2330,6 +2175,7 @@ class MultiVisit(object):
 
         """
 
+        result = self.__result__
         if plot_kws is None:
             plot_kws = {"fmt": "bo", "capsize": 4}
         fig, ax = plt.subplots(figsize=figsize)
@@ -2361,9 +2207,10 @@ class MultiVisit(object):
 
         """
 
-        params = self.result.params
-        samples = self.sampler.get_chain()
-        var_names = self.result.var_names
+        result = self.__result__
+        params = result.params
+        samples = self.__sampler__.get_chain()
+        var_names = result.var_names
         n = len(self.datasets)
 
         if plotkeys == "all":
@@ -2407,8 +2254,9 @@ class MultiVisit(object):
         self, plotkeys=None, show_priors=True, show_ticklabels=False, kwargs=None
     ):
 
-        params = self.result.params
-        var_names = self.result.var_names
+        result = self.__result__
+        params = result.params
+        var_names = result.var_names
         n = len(self.datasets)
 
         if plotkeys == "all":
@@ -2423,7 +2271,7 @@ class MultiVisit(object):
             plotkeys = list(set(var_names).intersection(l))
             plotkeys.sort()
 
-        chain = self.sampler.get_chain(flat=True)
+        chain = self.__sampler__.get_chain(flat=True)
         xs = []
         if "T_0" in plotkeys:
             d0 = np.floor(np.nanmedian(chain[:, var_names.index("T_0")]))
@@ -2498,8 +2346,8 @@ class MultiVisit(object):
 
         if show_priors:
             for i, key in enumerate(plotkeys):
-                u = params[key].user_data
-                if isinstance(u, UFloat):
+                q = params[key].user_data
+                if isinstance(q, UFloat):
                     ax = axes[i, i]
                     ax.axvline(q.n - q.s, color="g", linestyle="--")
                     ax.axvline(q.n + q.s, color="g", linestyle="--")
@@ -2678,7 +2526,7 @@ class MultiVisit(object):
         """
         If there are gaps in the data longer than gap_tol phase units and
         add_gaps is True then put a gap in the lines used to plot the fit. The
-        transit model is plotted using a thin line in these gaps.
+        transit/eclipse model is plotted using a thin line in these gaps.
 
         Binned data are plotted in phase bins of width binwidth. Set
         binwidth=False to disable this feature.
@@ -2691,7 +2539,8 @@ class MultiVisit(object):
         y-axis limits for the data and residuals plots can be set using the
         data_ylim and res_ylim keywords, e.g. res_ylim = (-0.001,0.001).
 
-        Set renorm=False to prevent automatic re-scaling of fluxes.
+        With renorm=True and detrend=False, each data set is re-scaled by the
+        value of c_01, c_02, for that data set.
 
         For fits to datasets containing a mixture of transits and eclipses,
         data_offset and res_offset can be 2-tuples with the offsets for
@@ -2738,29 +2587,9 @@ class MultiVisit(object):
                 fit = copy(self.__fluxes_fit__[j]) / c
             fluxes.append(flux)
             iqrmax = np.max([iqrmax, iqr(flux)])
-            fit = copy(result.bestfit[j])
-            modpar = copy(self.modpars[j])
-            for d in (
-                "c",
-                "dfdbg",
-                "dfdcontam",
-                "dfdsmear",
-                "glint_scale",
-                "dfdx",
-                "d2fdx2",
-                "dfdy",
-                "d2fdy2",
-                "dfdt",
-                "d2fdt2",
-                "ramp",
-            ):
-                p = f"{d}_{j+1:02d}"
-                if p in result.var_names:
-                    modpar[d].value = 1 if d == "c" else 0
-            model = self.models[j]
-            lcmod = model.eval(modpar, t=t)
-            trend = fit - lcmod
-            trend -= np.nanmedian(trend)
+            f_sho = self.__fluxes_sho__[j]
+            resids.append(flux - fit + f_sho)
+
             # Insert np.nan where there are gaps in phase so that the plotted
             # lines have a break
             lcmodel = copy(self.__fluxes_sys__[j])
@@ -2854,7 +2683,7 @@ class MultiVisit(object):
                     ax.plot(ph[k], lcmod[k] + off, c="forestgreen", zorder=2, lw=2)
 
             j_ecl, j_tr = 0, 0
-            for j, (ph, fp, i) in enumerate(zip(ph_plots, lc_plots, is_ecl)):
+            for j, (ph, fp, i) in enumerate(zip(ph_grid, lc_grid, is_ecl)):
                 if i:
                     off = j_ecl * doff_ecl
                     j_ecl += 1
@@ -3091,6 +2920,9 @@ class MultiVisit(object):
         keyword argument.
         """
 
+        flatchain = self.__sampler__.get_chain(flat=True)
+        vn = self.__result__.var_names
+        pars = self.__result__.params
         # Generate value(s) from previous emcee sampler run
         def _v(p):
             if p in vn:
