@@ -82,7 +82,7 @@ import warnings
 from astropy.units import UnitsWarning
 import cdspyreadme
 from textwrap import fill, indent
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from pathos.pools import ThreadPool as Pool
 from .constants import MAX_EXPOSURE_SEC
 from mpi4py import MPI
