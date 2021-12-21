@@ -16,7 +16,7 @@ from os import path
 here = path.abspath(path.dirname(__file__))
 
 # Get the long description from the README file
-with open(path.join(here, "README.rst"), encoding="utf-8") as f:
+with open("README.rst", encoding="utf-8") as f:
     long_description = f.read()
 
 with open(path.join(here, "pycheops/VERSION")) as version_file:
@@ -27,6 +27,7 @@ setup(
     # VERSION
     version=version,
     description="CHEOPS light curve analysis software",
+    long_description_content_type="text/x-rst",
     long_description=long_description,
     # The project's main homepage.
     url="http://cheops.unibe.ch/",
