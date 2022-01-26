@@ -1118,7 +1118,6 @@ class MultiVisit(object):
                     f_det = f_sys + f_fit - lc["flux"]
                     fluxes_det.append(f_det)
                     fluxes_sho.append(np.zeros_like(f_sys))
-                    lc_fits.append(mod)
                 else:
                     lnlike += -0.5 * (
                         np.sum(resid ** 2 / yvar + np.log(2 * np.pi * yvar))
@@ -2116,7 +2115,7 @@ class MultiVisit(object):
                 if len(x) == nm:
                     return x
                 elif len(x) > nm:
-                    return x[random_sample(range(len(x)), nm)]
+                    return x[np.random.random_sample(range(len(x)), nm)]
                 else:
                     return x[(np.random.random(nm) * len(x + 1)).astype(int)]
             elif isinstance(x, tuple):
