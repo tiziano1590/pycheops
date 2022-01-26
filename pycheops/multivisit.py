@@ -2115,7 +2115,7 @@ class MultiVisit(object):
                 if len(x) == nm:
                     return x
                 elif len(x) > nm:
-                    return x[np.random.random_sample(range(len(x)), nm)]
+                    return x[np.random.choice(range(len(x)), nm)]
                 else:
                     return x[(np.random.random(nm) * len(x + 1)).astype(int)]
             elif isinstance(x, tuple):
