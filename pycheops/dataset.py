@@ -25,7 +25,9 @@ Dataset
 """
 
 from __future__ import absolute_import, division, print_function, unicode_literals
+from IPython.core.display import display
 import numpy as np
+import os
 import tarfile
 from zipfile import ZipFile
 import re
@@ -37,13 +39,17 @@ from astropy.table import Table, MaskedColumn
 import matplotlib.pyplot as plt
 from .instrument import transit_noise
 from ftplib import FTP
-from .models import TransitModel, FactorModel, EclipseModel
+from .models import TransitModel as TransitModelBase
+from .models import TransitModelOversample, FactorModel, EclipseModel
 from lmfit import Parameter, Parameters, minimize, Minimizer, fit_report
 from lmfit import __version__ as _lmfit_version_
 from lmfit import Model
 from scipy.interpolate import interp1d, LSQUnivariateSpline
 import matplotlib.pyplot as plt
 from emcee import EnsembleSampler
+from ultranest import ReactiveNestedSampler
+from ultranest.stepsampler import RegionSliceSampler
+from scipy.special import ndtri
 import corner
 from copy import copy, deepcopy
 from celerite2 import terms, GaussianProcess
@@ -76,7 +82,17 @@ import warnings
 from astropy.units import UnitsWarning
 import cdspyreadme
 from textwrap import fill, indent
-import os
+from contextlib import redirect_stdout, redirect_stderr
+from pathos.pools import ThreadPool as Pool
+from .constants import MAX_EXPOSURE_SEC
+from mpi4py import MPI
+
+with open(os.devnull, "w") as devnull:
+    with redirect_stderr(devnull):
+        from dace.cheops import Cheops
+
+LN2PI = np.log(2.0 * np.pi)
+LNSIGMA = np.log(10)
 from contextlib import redirect_stderr
 
 with open(os.devnull, "w") as devnull:
@@ -133,7 +149,7 @@ def _glint_func(t, glint_scale, f_theta=None, f_glint=None):
 # ---
 
 
-def _make_trial_params(pos, params, vn):
+def _make_trial_params(pos=None, params=None, vn=None):
     # Create a copy of the params object with the parameter values give in
     # list vn replaced with trial values from array pos.
     # Also returns the contribution to the log-likelihood of the parameter
@@ -724,7 +740,7 @@ class Dataset(object):
     def __setstate__(self, state):
         def reconstruct_model(model_repr, state):
             if "_transit_func" in model_repr:
-                model = TransitModel() * self.__factor_model__()
+                model = TransitModelBase() * self.__factor_model__()
             elif "_eclipse_func" in model_repr:
                 model = EclipseModel() * self.__factor_model__()
             if "glint_func" in model_repr:
@@ -1326,6 +1342,9 @@ class Dataset(object):
         glint_scale=None,
         logrhoprior=None,
         log_sigma=None,
+        # Luca Borsato 2021-07-22
+        # undersampled light-curves with t_exp > 60s -> oversampling to n_over = int(t_exp / 60s)
+        t_exp_s=MAX_EXPOSURE_SEC,
     ):
         """
         Fit a transit to the light curve in the current dataset.
@@ -1438,6 +1457,20 @@ class Dataset(object):
             params.add(name="h_2", value=0.6713, vary=False)
         else:
             params["h_2"] = _kw_to_Parameter("h_2", h_2)
+
+        # -- LBO
+        if t_exp_s > MAX_EXPOSURE_SEC:
+            t_exp = t_exp_s / 86400.0
+            n_over = int(t_exp_s / MAX_EXPOSURE_SEC) + 1
+            TransitModel = TransitModelOversample
+            # if n_over%2 == 0: n_over += 1
+        else:
+            t_exp = MAX_EXPOSURE_SEC / 86400.0
+            n_over = 1
+            TransitModel = TransitModelBase
+        params.add(name="t_exp", value=t_exp, vary=False)
+        params.add(name="n_over", value=n_over, vary=False)
+
         if c is None:
             params.add(name="c", value=1, min=min(flux) / 2, max=2 * max(flux))
         else:
@@ -1992,6 +2025,277 @@ class Dataset(object):
         report += "\n    pycheops   : %s" % __version__
         report += "\n    lmfit      : %s" % _lmfit_version_
         return report
+
+    ### ULTRANEST FUNCTIONS
+    def ultra_prior_transform(self, theta, **kwargs):
+        """
+        A function defining the transform between the paramettrisation in the unit hypercube to the true parameters.
+
+
+        Args:
+            theta (list): a list/array containing the parameters
+        Returns:
+            list: a new list/array with the transformed parameters.
+        """
+        pars = np.array([t for t in theta])
+
+        pmins = np.array([0 for t in theta])  # TODO change with input bounds
+        pmaxs = np.array([10 for t in theta])  # TODO change with input bounds
+
+        pmus = np.array([0 for t in theta])  # TODO change with input bounds
+        psigmas = np.array([10 for t in theta])  # TODO change with input bounds
+
+        priors = [pmus[i] + psigmas[i] * ndtri(pars[i]) for i, _ in enumerate(pars)]
+
+        return np.array(priors)
+
+    def ultra_loglikelihood(self, theta, **kwargs):
+        """
+        The log likelihood function.
+        """
+        pars = np.array([t for t in theta])
+
+        return True
+
+    # ----------------------------------------------------------------
+    def ultranest_sampler(
+        self,
+        params=None,
+        live_points=500,
+        tol=0.5,
+        cluster_num_live_points=40,
+        logdir=None,
+        resume="overwrite",
+        adaptive_nsteps=False,
+        log_sigma=None,
+        add_shoterm=False,
+        log_omega0=None,
+        log_S0=None,
+        log_Q=None,
+        init_scale=1e-2,
+        progress=True,
+        backend=None,
+    ):
+        """
+        If you only want to store and yield 1-in-thin samples in the chain, set
+        thin to an integer greater than 1. When this is set, thin*steps will be
+        made and the chains returned with have "steps" values per walker.
+        """
+
+        try:
+            time = np.array(self.lc["time"])
+            flux = np.array(self.lc["flux"])
+            flux_err = np.array(self.lc["flux_err"])
+        except AttributeError:
+            raise AttributeError("Use get_lightcurve() to load data first.")
+        # See https://emcee.readthedocs.io/en/stable/tutorials/monitor/ for use
+        # of the backend keyword.
+
+        try:
+            model = self.model
+        except AttributeError:
+            raise AttributeError("Use lmfit_transit() or lmfit_eclipse() first.")
+
+        # Make a copy of the lmfit Minimizer result as a template for the
+        # output of this method
+        result = deepcopy(self.lmfit)
+        result.method = "emcee"
+        # Remove components on result not relevant for emcee
+        result.status = None
+        result.success = None
+        result.message = None
+        result.ier = None
+        result.lmdif_message = None
+
+        if params is None:
+            params = self.lmfit.params.copy()
+        k = params.valuesdict().keys()
+        if add_shoterm:
+            if "log_S0" in k:
+                pass
+            elif log_S0 is None:
+                params.add("log_S0", value=-12, min=-30, max=0)
+            else:
+                params["log_S0"] = _kw_to_Parameter("log_S0", log_S0)
+            # For time in days, and the default value of Q=1/sqrt(2),
+            # log_omega0=8  is a correlation length of about 30s and
+            # -2.3 is about 10 days.
+            if "log_omega0" in k:
+                pass
+            elif log_omega0 is None:
+                params.add("log_omega0", value=3, min=-2.3, max=8)
+            else:
+                lw0 = _kw_to_Parameter("log_omega0", log_omega0)
+                params["log_omega0"] = lw0
+            if "log_Q" in params:
+                pass
+            elif log_Q is None:
+                params.add("log_Q", value=np.log(1 / np.sqrt(2)), vary=False)
+            else:
+                params["log_Q"] = _kw_to_Parameter("log_Q", log_Q)
+
+        if "log_sigma" in k:
+            pass
+        elif log_sigma is None:
+            if not "log_sigma" in params:
+                params.add("log_sigma", value=-10, min=-16, max=-1)
+                params["log_sigma"].stderr = 1
+        else:
+            params["log_sigma"] = _kw_to_Parameter("log_sigma", log_sigma)
+        params.add("sigma_w", expr="exp(log_sigma)*1e6")
+
+        vv, vs, vn = [], [], []
+        for p in params:
+            if params[p].vary:
+                vn.append(p)
+                vv.append(params[p].value)
+                if params[p].stderr is None:
+                    if params[p].user_data is None:
+                        vs.append(0.01 * (params[p].max - params[p].min))
+                    else:
+                        vs.append(params[p].user_data.s)
+                else:
+                    if np.isfinite(params[p].stderr):
+                        vs.append(params[p].stderr)
+                    else:
+                        vs.append(0.01 * (params[p].max - params[p].min))
+
+        result.var_names = vn
+        result.init_vals = vv
+        result.init_values = {}
+        for n, v in zip(vn, vv):
+            result.init_values[n] = v
+
+        vv = np.array(vv)
+        vs = np.array(vs)
+
+        # Initialize sampler positions ensuring all walkers produce valid
+        # function values.
+        n_varys = len(vv)
+        params_tmp = params.copy()
+
+        vary_params = params.copy()
+        for key in list(vary_params.keys()):
+            if not vary_params[key].vary:
+                del vary_params[key]
+
+        pos = vv + vs * np.random.randn(n_varys) * init_scale
+
+        # TODO select parameters to put in nested sampler
+        # by checking if it varies, i.e. params[key].vary = True
+
+        # Defines prior
+
+        def make_trial_params(pos=pos):
+            # Create a copy of the params object with the parameter values give in
+            # list vn replaced with trial values from array pos.
+            # Also returns the contribution to the log-likelihood of the parameter
+            # values.
+            # Return value is priors
+
+            pars = np.array([t for t in pos])
+
+            pmins = np.array([vary_params[par].min for par in list(vary_params.keys())])
+            pmaxs = np.array([vary_params[par].max for par in list(vary_params.keys())])
+
+            pmins[np.where(pmins == -np.inf)] = -1  # float("-inf")
+            pmaxs[np.where(pmaxs == np.inf)] = 1  # float("inf")
+
+            priors = pars * (pmaxs - pmins) + pmins
+
+            return np.array(priors)
+
+        def ultra_log_prior_func(pos):
+            lnprior = make_trial_params(pos=pos)
+            return lnprior
+
+        parcopy = params_tmp.copy()
+
+        # Defines likelihood
+        def ultra_log_posterior_jitter(pos):
+
+            # parcopy = params_tmp.copy()
+            for j, key in enumerate(list(vary_params.keys())):
+                parcopy[key].set(value=pos[j])
+            #
+            # print(parcopy)
+
+            fit = model.eval(parcopy, t=time)
+            # if return_fit:
+            #     return fit
+
+            # if False in np.isfinite(fit):
+            #     return 0
+
+            jitter = np.exp(parcopy["log_sigma"].value)
+            s2 = flux_err ** 2 + jitter ** 2
+            lnlike = -0.5 * (np.sum((flux - fit) ** 2 / s2 + np.log(2 * np.pi * s2)))
+            return lnlike
+
+        # ----
+
+        def ultra_log_posterior_SHOTerm(pos):
+
+            # parcopy = params_tmp.copy()
+
+            for j, key in enumerate(list(vary_params.keys())):
+                parcopy[key].set(value=pos[j])
+
+            fit = model.eval(parcopy, t=time)
+            # if return_fit:
+            #     return fit
+
+            # if False in np.isfinite(fit):
+            #     return -1
+
+            resid = flux - fit
+            kernel = SHOTerm(
+                S0=np.exp(parcopy["log_S0"].value),
+                Q=np.exp(parcopy["log_Q"].value),
+                w0=np.exp(parcopy["log_omega0"].value),
+            )
+            gp = GaussianProcess(kernel, mean=0)
+            yvar = flux_err ** 2 + np.exp(2 * parcopy["log_sigma"].value)
+            gp.compute(time, diag=yvar, quiet=True)
+            lnlike = gp.log_likelihood(resid)
+            return lnlike
+
+        args = (model, time, flux, flux_err, params, vn)
+        p = list(vary_params.keys())
+        if "log_S0" in p and "log_omega0" in p and "log_Q" in p:
+            ultra_log_posterior_func = ultra_log_posterior_SHOTerm
+            self.gp = True
+        else:
+            ultra_log_posterior_func = ultra_log_posterior_jitter
+            self.gp = False
+        return_fit = False
+        args += (return_fit,)
+
+        print(f"Running Ultranest")
+        sampler = ReactiveNestedSampler(
+            p,
+            ultra_log_posterior_func,
+            ultra_log_prior_func,
+            log_dir=logdir,
+            resume=resume,
+            draw_multiple=True,
+            storage_backend="hdf5",
+        )
+
+        nsteps = 2 * len(p)
+
+        sampler.stepsampler = RegionSliceSampler(
+            nsteps=nsteps, adaptive_nsteps=adaptive_nsteps
+        )
+
+        sampler.run(
+            min_num_live_points=live_points,
+            dlogz=tol,
+            cluster_num_live_points=cluster_num_live_points,
+        )
+
+        self.__lastfit__ = "ultranest"
+        return sampler
 
     # ----------------------------------------------------------------
 
@@ -2820,7 +3124,7 @@ class Dataset(object):
                 if len(x) == nm:
                     return x
                 elif len(x) > nm:
-                    return x[random_sample(range(len(x)), nm)]
+                    return x[np.random.sample(range(len(x)), nm)]
                 else:
                     return x[(np.random.random(nm) * len(x + 1)).astype(int)]
             elif isinstance(x, tuple):

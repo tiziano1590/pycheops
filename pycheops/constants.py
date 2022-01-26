@@ -125,3 +125,5 @@ au =  1.49597870700E11        # m, IAU 2009 Astronomical unit
 pc =  3600*au*180/pi          # m, parsec
 c  = 299792458                # m.s-1, speed of light
 
+# Luca Borsato adding constants
+MAX_EXPOSURE_SEC = 60.0
