@@ -1,9 +1,9 @@
-PYCHEOPS
-========
+PYCHEOPS-ULTRA
+==============
 
 Python package for the analysis of light curves from the `ESA CHEOPS mission <http://cheops.unibe.ch/>`_.
 
-Use ``pip install pycheops`` to install.
+Use ``pip install pycheops-ultra`` to install.
 
 See `pycheops/examples/Notebooks <https://github.com/pmaxted/pycheops/tree/master/pycheops/examples/Notebooks>`_ for examples.
 
