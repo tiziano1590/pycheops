@@ -2099,7 +2099,7 @@ class Dataset(object):
         # Make a copy of the lmfit Minimizer result as a template for the
         # output of this method
         result = deepcopy(self.lmfit)
-        result.method = "emcee"
+        result.method = "ultranest"
         # Remove components on result not relevant for emcee
         result.status = None
         result.success = None

@@ -45,6 +45,8 @@ from celerite2 import GaussianProcess
 from .funcs import rhostar, massradius, eclipse_phase
 from uncertainties import UFloat, ufloat
 from emcee import EnsembleSampler
+from ultranest import ReactiveNestedSampler
+from ultranest.stepsampler import RegionSliceSampler
 import corner
 from sys import stdout
 import matplotlib.pyplot as plt
@@ -971,6 +973,737 @@ class MultiVisit(object):
 
         return result
 
+    def __run_ultranest__(self, **kwargs):
+
+        # Dict of initial parameter values for creation of models
+        # Calculation of mean T_0 needs P and W so T_0 is not first in the list
+        vals = OrderedDict()
+        for k in ["D", "W", "b", "P", "T_0", "f_c", "f_s"]:
+            vals[k] = kwargs[k]
+        fittype = self.__fittype__
+        if fittype == "transit" or fittype == "eblm":
+            vals["h_1"] = kwargs["h_1"]
+            vals["h_2"] = kwargs["h_2"]
+        if fittype == "eclipse" or fittype == "eblm":
+            vals["L"] = kwargs["L"]
+            vals["a_c"] = kwargs["a_c"]
+
+        # dicts of parameter limits and step sizes for initialisation
+        pmin = {
+            "P": 0,
+            "D": 0,
+            "W": 0,
+            "b": 0,
+            "f_c": -1,
+            "f_s": -1,
+            "h_1": 0,
+            "h_2": 0,
+            "L": 0,
+        }
+        pmax = {
+            "D": 0.3,
+            "W": 0.3,
+            "b": 2.0,
+            "f_c": 1,
+            "f_s": 1,
+            "h_1": 1,
+            "h_2": 1,
+            "L": 1.0,
+        }
+        step = {
+            "D": 1e-4,
+            "W": 1e-4,
+            "b": 1e-2,
+            "P": 1e-6,
+            "T_0": 1e-4,
+            "f_c": 1e-4,
+            "f_s": 1e-3,
+            "h_1": 1e-3,
+            "h_2": 1e-2,
+            "L": 1e-5,
+        }
+
+        # Create a Parameters() object with initial values and priors on model
+        # parameters (including fixed parameters)
+        extra_priors = kwargs["extra_priors"]
+        priors = {} if extra_priors is None else extra_priors
+        params = Parameters()
+        plist = [
+            d.emcee.params if d.__lastfit__ == "emcee" else d.lmfit.params
+            for d in self.datasets
+        ]
+        vv, vs, vn = [], [], []  # Free params for emcee, name value, err
+        for k in vals:
+            if vals[k] is None:  # No user-defined value
+
+                # Use mean of best-fit values from datasets
+                if k is "T_0":
+                    t = np.array([p[k].value for p in plist])
+                    c = np.round((t - t[0]) / params["P"])
+                    c -= c.max() // 2
+                    t -= c * params["P"]
+                    val = t.mean()
+                    vmin = val - params["W"] * params["P"] / 2
+                    vmax = val + params["W"] * params["P"] / 2
+                else:
+                    # Not all datasets have all parameters so ...
+                    v = [p[k].value if k in p else np.nan for p in plist]
+                    val = np.nanmean(v)
+                    v = [p[k].min if k in p else np.nan for p in plist]
+                    vmin = np.nanmin(v)
+                    if (k in pmin) and not np.isfinite(vmin):
+                        vmin = pmin[k]
+                    v = [p[k].max if k in p else np.nan for p in plist]
+                    vmax = np.nanmax(v)
+                    if (k in pmax) and not np.isfinite(vmax):
+                        vmax = pmax[k]
+                vary = True in [p[k].vary if k in p else False for p in plist]
+                params.add(k, val, vary=vary, min=vmin, max=vmax)
+                vals[k] = val
+
+            else:  # User-defined value for parameter from kwargs
+
+                params[k] = _kw_to_Parameter(k, vals[k])
+                vals[k] = params[k].value
+                if (k in pmin) and not np.isfinite(params[k].min):
+                    params[k].min = pmin[k]
+                if (k in pmax) and not np.isfinite(params[k].max):
+                    params[k].max = pmax[k]
+
+            if params[k].vary:
+                vn.append(k)
+                vv.append(params[k].value)
+                if isinstance(params[k].user_data, UFloat):
+                    priors[k] = params[k].user_data
+                # Step size for setting up initial walker positions
+                if params[k].stderr is None:
+                    if params[k].user_data is None:
+                        vs.append(step[k])
+                    else:
+                        vs.append(params[k].user_data.s)
+                else:
+                    if np.isfinite(params[k].stderr):
+                        vs.append(params[k].stderr)
+                    else:
+                        vs.append(step[k])
+            else:
+                # Needed to avoid errors when printing parameters
+                params[k].stderr = None
+
+        # Derived parameters
+        params.add("k", expr="sqrt(D)", min=0, max=1)
+        params.add("aR", expr="sqrt((1+k)**2-b**2)/W/pi", min=1)
+        params.add("sini", expr="sqrt(1 - (b/aR)**2)")
+        # Avoid use of aR in this expr for logrho - breaks error propogation.
+        expr = "log10(4.3275e-4*((1+k)**2-b**2)**1.5/W**3/P**2)"
+        params.add("logrho", expr=expr, min=-9, max=6)
+        params.add("e", min=0, max=1, expr="f_c**2 + f_s**2")
+        if "h_1" in params:
+            params.add("q_1", min=0, max=1, expr="(1-h_2)**2")
+            params.add("q_2", min=0, max=1, expr="(h_1-h_2)/(1-h_2)")
+        # Priors given in extra_priors overwrite existing priors
+        if extra_priors is not None:
+            for k in extra_priors:
+                if k in params:
+                    params[k].user_data = extra_priors[k]
+
+        if fittype == "transit":
+            ttv = kwargs["ttv"]
+            ttv_prior = kwargs["ttv_prior"]
+            if ttv and (params["T_0"].vary or params["P"].vary):
+                raise ValueError("TTV not allowed if P or T_0 are variables")
+            edv, edv_prior = False, None
+
+        if fittype == "eclipse":
+            edv = kwargs["edv"]
+            edv_prior = kwargs["edv_prior"]
+            if edv and params["L"].vary:
+                raise ValueError("L must be a fixed parameter of edv=True.")
+            ttv, ttv_prior = False, None
+
+        if fittype == "eblm":
+            ttv = kwargs["ttv"]
+            ttv_prior = kwargs["ttv_prior"]
+            if ttv and (params["T_0"].vary or params["P"].vary):
+                raise ValueError("TTV not allowed if P or T_0 are variables")
+            edv = kwargs["edv"]
+            edv_prior = kwargs["edv_prior"]
+            if edv and params["L"].vary:
+                raise ValueError("L must be a fixed parameter of edv=True.")
+
+        # Make an lmfit Parameters() object that defines the noise model
+        noisemodel = Parameters()
+        k = "log_sigma_w"
+        log_sigma_w = kwargs["log_sigma_w"]
+        if log_sigma_w is None:
+            noisemodel.add(k, -6, min=-12, max=-2)
+        else:
+            noisemodel[k] = _kw_to_Parameter(k, log_sigma_w)
+            # Avoid crazy-low values that are consistent with sigma_w = 0
+            if not np.isfinite(noisemodel[k].min):
+                noisemodel[k].min = np.min([noisemodel[k].value - 10, -30])
+        params[k] = copy(noisemodel[k])
+        if isinstance(noisemodel[k].user_data, UFloat):
+            priors[k] = noisemodel[k].user_data
+        if noisemodel[k].vary:
+            vn.append(k)
+            vv.append(noisemodel[k].value)
+            vs.append(1)
+
+        log_S0 = kwargs["log_S0"]
+        log_omega0 = kwargs["log_omega0"]
+        log_Q = kwargs["log_Q"]
+        if log_S0 is not None and log_omega0 is not None:
+            if log_Q is None:
+                log_Q = np.log(1 / np.sqrt(2))
+            nvals = {"log_S0": log_S0, "log_omega0": log_omega0, "log_Q": log_Q}
+            for k in nvals:
+                noisemodel[k] = _kw_to_Parameter(k, nvals[k])
+                params[k] = copy(noisemodel[k])
+                if isinstance(noisemodel[k].user_data, UFloat):
+                    priors[k] = noisemodel[k].user_data
+                if noisemodel[k].vary:
+                    vn.append(k)
+                    vv.append(noisemodel[k].value)
+                    vs.append(1)
+            params.add("rho_SHO", expr="2*pi/exp(log_omega0)")
+            params.add("tau_SHO", expr="2*exp(log_Q)/exp(log_omega0)")
+            params.add("sigma_SHO", expr="sqrt(exp(log_Q+log_S0+log_omega0))")
+            noisemodel.add("rho_SHO", expr="2*pi/exp(log_omega0)")
+            noisemodel.add("tau_SHO", expr="2*exp(log_Q)/exp(log_omega0)")
+            noisemodel.add("sigma_SHO", expr="sqrt(exp(log_Q+log_S0+log_omega0))")
+
+        # Lists of model parameters and data for individual datasets
+        fluxes_unwrap = []
+        rolls = []
+        models = []
+        modpars = []
+
+        # Cycle over datasets, each with its own set of parameters
+        for i, (d, p) in enumerate(zip(self.datasets, plist)):
+
+            f_unwrap = np.zeros_like(d.lc["time"])
+            if kwargs["unwrap"]:
+                phi = d.lc["roll_angle"] * np.pi / 180
+                for j in range(1, 4):
+                    k = "dfdsinphi" if j < 2 else f"dfdsin{j}phi"
+                    if k in p:
+                        f_unwrap += p[k] * np.sin(j * phi)
+                    k = "dfdcosphi" if j < 2 else f"dfdcos{j}phi"
+                    if k in p:
+                        f_unwrap += p[k] * np.cos(j * phi)
+            fluxes_unwrap.append(f_unwrap)
+
+            t = d.lc["time"]
+            try:
+                smear = d.lc["smear"]
+            except KeyError:
+                smear = np.zeros_like(t)
+            try:
+                deltaT = d.lc["deltaT"]
+            except KeyError:
+                deltaT = np.zeros_like(t)
+            factor_model = FactorModel(
+                dx=_make_interp(t, d.lc["xoff"], scale="range"),
+                dy=_make_interp(t, d.lc["yoff"], scale="range"),
+                bg=_make_interp(t, d.lc["bg"], scale="max"),
+                contam=_make_interp(t, d.lc["contam"], scale="max"),
+                smear=_make_interp(t, smear, scale="max"),
+                deltaT=_make_interp(t, deltaT),
+            )
+            if fittype == "transit":
+                model = TransitModel() * factor_model
+            elif fittype == "eclipse":
+                model = EclipseModel() * factor_model
+            elif fittype == "eblm":
+                model = EBLMModel() * factor_model
+
+            if "glint_scale" in p:
+                delta_t = d._old_bjd_ref - d.bjd_ref
+                model += Model(
+                    _glint_func,
+                    independent_vars=["t"],
+                    f_theta=d.f_theta,
+                    f_glint=d.f_glint,
+                    delta_t=delta_t,
+                )
+            models.append(model)
+
+            modpar = model.make_params(verbose=False, **vals)
+            # Copy min/max values from params to modpar
+            for pm in modpar:
+                if pm in params:
+                    modpar[pm].min = params[pm].min
+                    modpar[pm].max = params[pm].max
+
+            if ttv:
+                modpar["T_0"].init_value = modpar["T_0"].value
+            modpars.append(modpar)
+
+            if ttv:
+                t = f"ttv_{i+1:02d}"
+                params.add(t, 0)
+                params[t].user_data = ufloat(0, ttv_prior)
+                vn.append(t)
+                vv.append(0)
+                vs.append(30)
+                priors[t] = params[t].user_data
+
+            if edv:
+                t = f"L_{i+1:02d}"
+                params.add(t, vals["L"])
+                params[t].user_data = ufloat(vals["L"], edv_prior)
+                vn.append(t)
+                vv.append(vals["L"])
+                vs.append(edv_prior)
+                priors[t] = params[t].user_data
+
+            for dfdp in [
+                "c",
+                "dfdbg",
+                "dfdcontam",
+                "dfdsmear",
+                "dfdx",
+                "d2fdx2",
+                "dfdy",
+                "d2fdy2",
+                "dfdt",
+                "d2fdt2",
+                "glint_scale",
+                "ramp",
+            ]:
+
+                if dfdp in p and p[dfdp].vary:
+                    pj = f"{dfdp}_{i+1:02d}"
+                    params.add(pj, p[dfdp].value, min=p[dfdp].min, max=p[dfdp].max)
+                    if pj in priors:
+                        params[pj].user_data = priors[pj]
+                    vn.append(pj)
+                    vv.append(p[dfdp].value)
+                    if dfdp == "c":
+                        vs.append(1e-6)
+                    elif dfdp == "glint_scale":
+                        vs.append(0.01)
+                    elif dfdp == "ramp":
+                        vs.append(50)
+                    else:
+                        vs.append(1e-6)
+
+            if kwargs["unroll"]:
+                sinphi = np.sin(np.radians(d.lc["roll_angle"]))
+                s = SineModel.fit(sinphi, P=99 / 1440, x0=0, x=d.lc["time"])
+                Omega = 2 * np.pi / s.params["P"]
+                fluxrms = np.nanstd(d.lc["flux"])
+                roll = CosineTerm(omega_j=Omega, sigma_j=fluxrms)
+                for j in range(2, kwargs["nroll"] + 1):
+                    roll = roll + CosineTerm(omega_j=j * Omega, sigma_j=fluxrms)
+                rolls.append(roll)
+            else:
+                rolls.append(None)
+        # END of for dataset in self.datasets:
+
+        # Copy parameters, models, priors, etc. to self.
+        self.__rolls__ = rolls
+        self.__models__ = models
+        self.__modpars__ = modpars
+        self.__noisemodel__ = noisemodel
+        self.__priors__ = priors
+        self.__var_names__ = vn  # Change of name for consistency with result
+        self.__fluxes_unwrap__ = fluxes_unwrap
+
+        backend = kwargs["backend"]
+        if backend is None:
+            iteration = 0
+        else:
+            try:
+                iteration = backend.iteration
+            except OSError:
+                iteration = 0
+        # Setup sampler
+        vv = np.array(vv)
+        vs = np.array(vs)
+        n_varys = len(vv)
+        params_tmp = params.copy()
+
+        vary_params = params.copy()
+        for key in list(vary_params.keys()):
+            if not vary_params[key].vary:
+                del vary_params[key]
+
+        pos = vv + vs * np.random.randn(n_varys) * kwargs["init_scale"]
+
+        # TODO select parameters to put in nested sampler
+        # by checking if it varies, i.e. params[key].vary = True
+
+        # Defines prior
+
+        def make_trial_params(pos=pos):
+            # Create a copy of the params object with the parameter values give in
+            # list vn replaced with trial values from array pos.
+            # Also returns the contribution to the log-likelihood of the parameter
+            # values.
+            # Return value is priors
+
+            pars = np.array([t for t in pos])
+
+            pmins = np.array([vary_params[par].min for par in list(vary_params.keys())])
+            pmaxs = np.array([vary_params[par].max for par in list(vary_params.keys())])
+
+            pmins[np.where(pmins == -np.inf)] = -1  # float("-inf")
+            pmaxs[np.where(pmaxs == np.inf)] = 1  # float("inf")
+
+            priors = pars * (pmaxs - pmins) + pmins
+
+            return np.array(priors)
+
+        def ultra_log_prior_func(pos):
+            lnprior = make_trial_params(pos=pos)
+            return lnprior
+
+        parcopy = params_tmp.copy()
+
+        # Defines likelihood
+        def ultra_log_posterior_jitter(pos):
+
+            # parcopy = params_tmp.copy()
+            for j, key in enumerate(list(vary_params.keys())):
+                parcopy[key].set(value=pos[j])
+            #
+            # print(parcopy)
+
+            fit = model.eval(parcopy, t=d.lc["time"])
+            # if return_fit:
+            #     return fit
+
+            # if False in np.isfinite(fit):
+            #     return 0
+
+            jitter = np.exp(parcopy["log_sigma"].value)
+            s2 = d.lc["flux_err"] ** 2 + jitter ** 2
+            lnlike = -0.5 * (
+                np.sum((d.lc["flux"] - fit) ** 2 / s2 + np.log(2 * np.pi * s2))
+            )
+            return lnlike
+
+        # ----
+
+        def ultra_log_posterior_SHOTerm(pos):
+
+            # parcopy = params_tmp.copy()
+
+            for j, key in enumerate(list(vary_params.keys())):
+                parcopy[key].set(value=pos[j])
+
+            fit = model.eval(parcopy, t=d.lc["time"])
+            # if return_fit:
+            #     return fit
+
+            # if False in np.isfinite(fit):
+            #     return -1
+
+            resid = d.lc["flux"] - fit
+            kernel = SHOTerm(
+                S0=np.exp(parcopy["log_S0"].value),
+                Q=np.exp(parcopy["log_Q"].value),
+                w0=np.exp(parcopy["log_omega0"].value),
+            )
+            gp = GaussianProcess(kernel, mean=0)
+            yvar = d.lc["flux_err"] ** 2 + np.exp(2 * parcopy["log_sigma"].value)
+            gp.compute(d.lc["time"], diag=yvar, quiet=True)
+            lnlike = gp.log_likelihood(resid)
+            return lnlike
+
+        def _lnpost_ultra_(pos):
+
+            lnlike = 0
+            if return_fit:
+                fluxes_sys = []  # transits and eclipses only
+                fluxes_fit = []  # lc fit per dataset
+                fluxes_sho = []  # GP process from SHOTerm() kernel only
+                fluxes_det = []  # detrended fluxes
+                fluxes_phi = []  # Roll-angle trends if unroll=True
+
+            # Update self.__noisemodel__ parameters
+            vn = self.__var_names__
+            noisemodel = self.__noisemodel__
+            for p in ("log_sigma_w", "log_omega0", "log_S0", "log_Q"):
+                if p in vn:
+                    v = pos[vn.index(p)]
+                    if (v < noisemodel[p].min) or (v > noisemodel[p].max):
+                        return -np.inf, -np.inf
+                    noisemodel[p].set(value=v)
+            if "log_Q" in noisemodel:
+                sho = SHOTerm(
+                    S0=np.exp(noisemodel["log_S0"].value),
+                    Q=np.exp(noisemodel["log_Q"].value),
+                    w0=np.exp(noisemodel["log_omega0"].value),
+                )
+            else:
+                sho = False
+
+            for i, dataset in enumerate(self.datasets):
+                lc = dataset.lc
+                model = self.__models__[i]
+                modpar = self.__modpars__[i]
+                roll = self.__rolls__[i]
+                f_unwrap = self.__fluxes_unwrap__[i]
+
+                for p in ("T_0", "P", "D", "W", "b", "f_c", "f_s", "h_1", "h_2", "L"):
+                    if p in vn:
+                        v = pos[vn.index(p)]
+                        if not np.isfinite(v):
+                            return -np.inf, -np.inf
+                        if (v < modpar[p].min) or (v > modpar[p].max):
+                            return -np.inf, -np.inf
+                        modpar[p].value = v
+
+                # Check that none of the derived parameters are out of range
+                for p in (
+                    "e",
+                    "q_1",
+                    "q_2",
+                    "k",
+                    "aR",
+                    "rho",
+                ):
+                    if p in modpar:
+                        v = modpar[p].value
+                        if not np.isfinite(v):
+                            return -np.inf, -np.inf
+                        if (v < modpar[p].min) or (v > modpar[p].max):
+                            return -np.inf, -np.inf
+
+                df = (
+                    "c",
+                    "dfdbg",
+                    "dfdcontam",
+                    "dfdsmear",
+                    "glint_scale",
+                    "ramp",
+                    "dfdx",
+                    "d2fdx2",
+                    "dfdy",
+                    "d2fdy2",
+                    "dfdt",
+                    "d2fdt2",
+                )
+                for d in df:
+                    p = f"{d}_{i+1:02d}"
+                    if p in vn:
+                        v = pos[vn.index(p)]
+                        if (v < modpar[d].min) or (v > modpar[d].max):
+                            return -np.inf, -np.inf
+                        modpar[d].value = v
+
+                p = f"ttv_{i+1:02d}"
+                if p in vn:
+                    v = pos[vn.index(p)]
+                    modpar["T_0"].value = modpar["T_0"].init_value + v / 86400
+
+                p = f"L_{i+1:02d}"
+                if p in vn:
+                    # Exclude negative eclipse depths
+                    if pos[vn.index(p)] < 0:
+                        return -np.inf, -np.inf
+                    modpar["L"].value = pos[vn.index(p)]
+
+                # Evalate components of the model so that we can extract them
+                f_model = model.eval(modpar, t=lc["time"])
+                resid = lc["flux"] - f_unwrap - f_model
+                yvar = np.exp(2 * noisemodel["log_sigma_w"]) + lc["flux_err"] ** 2
+
+                if roll or sho:
+                    if roll and sho:
+                        kernel = sho + roll
+                    elif sho:
+                        kernel = sho
+                    else:
+                        kernel = roll
+                    gp = GaussianProcess(kernel)
+                    gp.compute(lc["time"], diag=yvar, quiet=True)
+                    if return_fit:
+                        k = f"_{self.__fittype__}_func"
+                        f_sys = model.eval_components(params=modpar, t=lc["time"])[k]
+                        fluxes_sys.append(f_sys)
+                        f_celerite = gp.predict(resid, include_mean=False)
+                        f_fit = f_model + f_celerite + f_unwrap
+                        fluxes_fit.append(f_fit)
+                        if roll and sho:
+                            f_sho = gp.predict(
+                                resid, include_mean=False, kernel=gp.kernel.terms[0]
+                            )
+                            f_phi = gp.predict(
+                                resid, include_mean=False, kernel=gp.kernel.terms[1]
+                            )
+                        elif sho:
+                            f_sho = f_celerite
+                            f_phi = np.zeros_like(resid)
+                        else:
+                            f_sho = np.zeros_like(resid)
+                            f_phi = f_celerite
+
+                        f_det = f_sys + f_sho + f_fit - lc["flux"]
+                        fluxes_det.append(f_det)
+                        fluxes_sho.append(f_sho)
+                        fluxes_phi.append(f_phi)
+                    else:
+                        lnlike += gp.log_likelihood(resid)
+                else:
+                    if return_fit:
+                        k = f"_{self.__fittype__}_func"
+                        f_sys = model.eval_components(params=modpar, t=lc["time"])[k]
+                        fluxes_sys.append(f_sys)
+                        f_fit = f_model + f_unwrap
+                        fluxes_fit.append(f_fit)
+                        f_det = f_sys + f_fit - lc["flux"]
+                        fluxes_det.append(f_det)
+                        fluxes_sho.append(np.zeros_like(f_sys))
+                    else:
+                        lnlike += -0.5 * (
+                            np.sum(resid ** 2 / yvar + np.log(2 * np.pi * yvar))
+                        )
+
+            if return_fit:
+                return fluxes_fit, fluxes_sys, fluxes_det, fluxes_sho, fluxes_phi
+
+            args = [modpar[p] for p in ("D", "W", "b")]
+
+            return lnlike
+
+        args = (model, d.lc["time"], d.lc["flux"], d.lc["flux_err"], params, vn)
+        p = list(vary_params.keys())
+        if "log_S0" in p and "log_omega0" in p and "log_Q" in p:
+            ultra_log_posterior_func = ultra_log_posterior_SHOTerm
+            self.gp = True
+        else:
+            ultra_log_posterior_func = ultra_log_posterior_jitter
+            self.gp = False
+        return_fit = False
+        args += (return_fit,)
+
+        print(f"Running Ultranest")
+        sampler = ReactiveNestedSampler(
+            p,
+            _lnpost_ultra_,
+            ultra_log_prior_func,
+            log_dir=kwargs["logdir"],
+            resume=kwargs["resume"],
+            draw_multiple=True,
+            storage_backend="hdf5",
+        )
+
+        nsteps = 2 * len(p)
+
+        sampler.stepsampler = RegionSliceSampler(
+            nsteps=nsteps, adaptive_nsteps=kwargs["adaptive_nsteps"]
+        )
+
+        sampler.run(
+            min_num_live_points=kwargs["live_points"],
+            dlogz=kwargs["tol"],
+            cluster_num_live_points=kwargs["cluster_num_live_points"],
+        )
+
+        self.__lastfit__ = "ultranest"
+        return sampler
+
+        # progress = kwargs["progress"]
+        # if progress:
+        #     print("Running burn-in ..")
+        #     stdout.flush()
+        # pos, _, _, _ = sampler.run_mcmc(
+        #     pos,
+        #     kwargs["burn"],
+        #     store=False,
+        #     skip_initial_state_check=True,
+        #     progress=progress,
+        # )
+        # sampler.reset()
+        # if progress:
+        #     print("Running sampler ..")
+        #     stdout.flush()
+        # state = sampler.run_mcmc(
+        #     pos,
+        #     kwargs["steps"],
+        #     thin_by=kwargs["thin"],
+        #     skip_initial_state_check=True,
+        #     progress=progress,
+        # )
+
+        # # Run self._lnpost_ with best-fit parameters to obtain
+        # # best-fit light curves, detrended fluxes, etc.
+        # flatchain = sampler.get_chain(flat=True)
+        # pos = flatchain[np.argmax(sampler.get_log_prob()), :]
+        # f_fit, f_sys, f_det, f_sho, f_phi = self._lnpost_(pos, return_fit=True)
+        # self.__fluxes_fit__ = f_fit
+        # self.__fluxes_sys__ = f_sys
+        # self.__fluxes_det__ = f_det
+        # self.__fluxes_sho__ = f_sho
+        # self.__fluxes_phi__ = f_phi
+
+        # # lmfit MinimizerResult object summary of results for printing and
+        # # plotting. Data/objects required to re-run the analysis go directly
+        # # into self.
+
+        # result = MinimizerResult()
+        # result.status = 0
+        # result.var_names = vn
+        # result.covar = np.cov(flatchain.T)
+        # result.init_vals = vv
+        # result.init_values = copy(params.valuesdict())
+        # af = sampler.acceptance_fraction.mean()
+        # result.acceptance_fraction = af
+        # steps, nwalkers, ndim = sampler.get_chain().shape
+        # result.thin = kwargs["thin"]
+        # result.nfev = int(kwargs["thin"] * nwalkers * steps / af)
+        # result.nwalkers = nwalkers
+        # result.nvarys = ndim
+        # result.ndata = sum([len(d.lc["time"]) for d in self.datasets])
+        # result.nfree = result.ndata - ndim
+        # result.method = "emcee"
+        # result.errorbars = True
+        # result.bestfit = f_fit
+        # result.fluxes_det = f_det
+        # z = zip(self.datasets, self.__fluxes_unwrap__, f_fit)
+        # result.residual = [(d.lc["flux"] - fu - ft) for d, fu, ft in z]
+        # z = zip(self.datasets, result.residual)
+        # result.chisqr = np.sum(((r / d.lc["flux_err"]) ** 2).sum() for d, r in z)
+        # result.redchi = result.chisqr / result.nfree
+        # lnlike = np.max(sampler.get_blobs())
+        # result.lnlike = lnlike
+        # result.aic = 2 * result.nvarys - 2 * lnlike
+        # result.bic = result.nvarys * np.log(result.ndata) - 2 * lnlike
+        # result.rms = [r.std() for r in result.residual]
+        # result.npriors = len(self.__priors__)
+        # result.priors = self.__priors__
+
+        # quantiles = np.percentile(flatchain, [15.87, 50, 84.13], axis=0)
+        # corrcoefs = np.corrcoef(flatchain.T)
+        # parbest = params.copy()
+        # for i, n in enumerate(vn):
+        #     std_l, median, std_u = quantiles[:, i]
+        #     params[n].value = median
+        #     params[n].stderr = 0.5 * (std_u - std_l)
+        #     parbest[n].value = pos[i]
+        #     parbest[n].stderr = 0.5 * (std_u - std_l)
+        #     if n in self.__noisemodel__:
+        #         self.__noisemodel__[n].value = median
+        #         self.__noisemodel__[n].stderr = 0.5 * (std_u - std_l)
+        #     correl = {}
+        #     for j, n2 in enumerate(vn):
+        #         if i != j:
+        #             correl[n2] = corrcoefs[i, j]
+        #     params[n].correl = correl
+        #     parbest[n].correl = correl
+        # result.params = params
+        # result.parbest = parbest
+        # result.flat_chain = flatchain
+        # self.__parbest__ = parbest
+        # self.__result__ = result
+        # self.__sampler__ = sampler
+
+        # return result
+
     # --------------------------------------------------------------------------
 
     def _lnpost_(self, pos, return_fit=False):
@@ -1197,6 +1930,55 @@ class MultiVisit(object):
         self.__fittype__ = "transit"
 
         return self.__run_emcee__(**kwargs)
+
+    def fit_transit_ultranest(
+        self,
+        T_0=None,
+        P=None,
+        ttv=False,
+        ttv_prior=3600,
+        unroll=True,
+        nroll=3,
+        unwrap=False,
+        D=None,
+        W=None,
+        b=None,
+        f_c=None,
+        f_s=None,
+        h_1=None,
+        h_2=None,
+        log_omega0=None,
+        log_S0=None,
+        extra_priors=None,
+        live_points=400,
+        tol=0.5,
+        cluster_num_live_points=40,
+        logdir=None,
+        resume="overwrite",
+        adaptive_nsteps="move-distance",
+        log_sigma_w=None,
+        log_Q=None,
+        thin=1,
+        init_scale=1e-2,
+        progress=True,
+        backend=None,
+    ):
+        """
+        Use ultranest to fit the transits in the current datasets
+
+        If T_0 and P are both fixed parameters then ttv=True can be used to
+        include the free parameters ttv_i, the offset in seconds from the
+        predicted time of mid-transit for each dataset i = 1, ..., N. The
+        prior on the values of ttv_i is a Gaussian with a width ttv_prior in
+        seconds.
+
+        """
+        # Get a dictionary of all keyword arguments excluding 'self'
+        kwargs = dict(locals())
+        del kwargs["self"]
+        self.__fittype__ = "transit"
+
+        return self.__run_ultranest__(**kwargs)
 
     # --------------------------------------------------------------------------
 
