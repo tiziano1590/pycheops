@@ -146,11 +146,11 @@ class StarProperties(object):
             self.gaiadr2 = db["obj_id_gaiadr2"][idx]
 
         else:
-            sweetCat = Table.read(sweetCatPath, format="csv")
-
             if match_arcsec is None:
                 entry = None
             else:
+
+                sweetCat = Table.read(sweetCatPath, format="csv")
                 cat_c = SkyCoord(sweetCat["RA"], sweetCat["DEC"], unit="hour,degree")
                 idx, sep, _ = coords.match_to_catalog_sky(cat_c)
                 if sep.arcsec[0] > match_arcsec:

@@ -90,6 +90,7 @@ setup(
         "cryptography>=36.0.0",
         "h5py>=3.5.0",
         "selenium>=3.141.0",
+        "pyGTC",
     ],
     dependency_links=["https://dace.unige.ch/api/python-dace-client/"],
     # List additional groups of dependencies here (e.g. development

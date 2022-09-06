@@ -1607,29 +1607,6 @@ class MultiVisit(object):
         self.__lastfit__ = "ultranest"
         return sampler
 
-        # progress = kwargs["progress"]
-        # if progress:
-        #     print("Running burn-in ..")
-        #     stdout.flush()
-        # pos, _, _, _ = sampler.run_mcmc(
-        #     pos,
-        #     kwargs["burn"],
-        #     store=False,
-        #     skip_initial_state_check=True,
-        #     progress=progress,
-        # )
-        # sampler.reset()
-        # if progress:
-        #     print("Running sampler ..")
-        #     stdout.flush()
-        # state = sampler.run_mcmc(
-        #     pos,
-        #     kwargs["steps"],
-        #     thin_by=kwargs["thin"],
-        #     skip_initial_state_check=True,
-        #     progress=progress,
-        # )
-
         # # Run self._lnpost_ with best-fit parameters to obtain
         # # best-fit light curves, detrended fluxes, etc.
         # flatchain = sampler.get_chain(flat=True)

@@ -51,6 +51,7 @@ from ultranest import ReactiveNestedSampler
 from ultranest.stepsampler import RegionSliceSampler
 from scipy.special import ndtri
 import corner
+import pygtc
 from copy import copy, deepcopy
 from celerite2 import terms, GaussianProcess
 from celerite2.terms import SHOTerm
@@ -2641,6 +2642,7 @@ class Dataset(object):
         plotkeys=["T_0", "D", "W", "b"],
         show_priors=True,
         show_ticklabels=False,
+        save_name=None,
         kwargs=None,
     ):
 
@@ -2704,30 +2706,38 @@ class Dataset(object):
 
         xs = np.array(xs).T
         labels = _make_labels(plotkeys, self.bjd_ref)
-        figure = corner.corner(xs, labels=labels, **kws)
+        try:
+            GTC = pygtc.plotGTC(
+                chains=xs,
+                paramNames=labels,
+                # figureSize='MNRAS_page',
+                plotName=save_name,
+            )
+            return GTC
+        except ImportError:
+            figure = corner.corner(xs, labels=labels, **kws)
+            nax = len(labels)
+            axes = np.array(figure.axes).reshape((nax, nax))
+            if not show_ticklabels:
+                for i in range(nax):
+                    ax = axes[-1, i]
+                    ax.set_xticklabels([])
+                    ax.set_xlabel(labels[i])
+                    ax.xaxis.set_label_coords(0.5, -0.1)
+                for i in range(1, nax):
+                    ax = axes[i, 0]
+                    ax.set_yticklabels([])
+                    ax.set_ylabel(labels[i])
+                    ax.yaxis.set_label_coords(-0.1, 0.5)
 
-        nax = len(labels)
-        axes = np.array(figure.axes).reshape((nax, nax))
-        if not show_ticklabels:
-            for i in range(nax):
-                ax = axes[-1, i]
-                ax.set_xticklabels([])
-                ax.set_xlabel(labels[i])
-                ax.xaxis.set_label_coords(0.5, -0.1)
-            for i in range(1, nax):
-                ax = axes[i, 0]
-                ax.set_yticklabels([])
-                ax.set_ylabel(labels[i])
-                ax.yaxis.set_label_coords(-0.1, 0.5)
-
-        if show_priors:
-            for i, key in enumerate(plotkeys):
-                u = params[key].user_data
-                if isinstance(u, UFloat):
-                    ax = axes[i, i]
-                    ax.axvline(u.n - u.s, color="g", linestyle="--")
-                    ax.axvline(u.n + u.s, color="g", linestyle="--")
-        return figure
+            if show_priors:
+                for i, key in enumerate(plotkeys):
+                    u = params[key].user_data
+                    if isinstance(u, UFloat):
+                        ax = axes[i, i]
+                        ax.axvline(u.n - u.s, color="g", linestyle="--")
+                        ax.axvline(u.n + u.s, color="g", linestyle="--")
+            return figure
 
     # ------------------------------------------------------------
 
